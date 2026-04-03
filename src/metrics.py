@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 import string
 import time
+import warnings
 from collections import Counter
 from typing import Any, Dict, List
 
@@ -135,7 +136,8 @@ def compute_comet(preds, refs, srcs, model_name="Unbabel/wmt22-comet-da"):
         data  = [{"src": s, "mt": p, "ref": r} for s, p, r in zip(srcs, preds, refs)]
         out   = model.predict(data, batch_size=8, gpus=0)
         return {"comet": float(out.system_score)}
-    except Exception:
+    except Exception as exc:
+        warnings.warn(f"COMET scoring failed: {exc}")
         return {"comet": -1.0}
 
 
@@ -165,18 +167,26 @@ def compute_rouge(preds: List[str], refs: List[str]) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
-def compute_efficiency(model, input_ids, n=5):
-    device    = next(model.parameters()).device
+def compute_efficiency(model, input_ids, attention_mask=None, n=5):
+    device = next(model.parameters()).device
     input_ids = input_ids.to(device)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
     model.eval()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     with torch.no_grad():
-        model(input_ids)  # warmup
+        if attention_mask is None:
+            model(input_ids)  # warmup
+        else:
+            model(input_ids, attention_mask=attention_mask)  # warmup
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(n):
-            model(input_ids)
+            if attention_mask is None:
+                model(input_ids)
+            else:
+                model(input_ids, attention_mask=attention_mask)
     ms  = (time.perf_counter() - t0) / n * 1000
     mem = (
         torch.cuda.max_memory_allocated(device) / 1024 ** 2

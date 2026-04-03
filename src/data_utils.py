@@ -34,11 +34,20 @@ from __future__ import annotations
 import ast
 import csv
 import json
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+
+def _cache_file(path: str, task: str, tokenizer, max_length: int) -> str:
+    tok_name = str(getattr(tokenizer, "name_or_path", "tokenizer")).replace("/", "_")
+    p = Path(path)
+    fname = f"{p.stem}.{task}.{tok_name}.len{max_length}.pt"
+    return str(p.with_name(fname))
 
 
 # ---------------------------------------------------------------------------
@@ -114,23 +123,59 @@ class DocMTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.rows = _load_rows(path, ["source", "target"])
+        self.samples: List[Dict[str, Any]] = []
+
+        cache_path = _cache_file(path, "docmt", tokenizer, max_length)
+        if os.path.isfile(cache_path):
+            print(f"[DocMTDataset] loading cache: {cache_path}")
+            self.samples = torch.load(cache_path, map_location="cpu")
+            print(f"[DocMTDataset] loaded cache: {cache_path} ({len(self.samples)} samples)")
+            return
+
+        batch_size = 128
+        for i in tqdm(range(0, len(self.rows), batch_size), desc=f"[DocMTDataset] Tokenizing {path}"):
+            chunk = self.rows[i:i + batch_size]
+            sources = [r["source"] for r in chunk]
+            targets = [r["target"] for r in chunk]
+
+            src = self.tokenizer(
+                sources,
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            tgt = self.tokenizer(
+                sources,
+                text_target=targets,
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            labels = tgt["input_ids"].clone()
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is not None:
+                labels = labels.masked_fill(labels == pad_id, -100)
+
+            for j, r in enumerate(chunk):
+                self.samples.append({
+                    "input_ids": src["input_ids"][j],
+                    "attention_mask": src["attention_mask"][j],
+                    "labels": labels[j],
+                    "source_text": r["source"],
+                    "target_text": r["target"],
+                })
+
+        torch.save(self.samples, cache_path)
+        print(f"[DocMTDataset] saved cache: {cache_path}")
 
     def __len__(self):
-        return len(self.rows)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        r = self.rows[idx]
-        src = self.tokenizer(r["source"], max_length=self.max_length,
-                             truncation=True, padding="max_length", return_tensors="pt")
-        tgt = self.tokenizer(r["target"], max_length=self.max_length,
-                             truncation=True, padding="max_length", return_tensors="pt")
-        return {
-            "input_ids":      src["input_ids"].squeeze(0),
-            "attention_mask": src["attention_mask"].squeeze(0),
-            "labels":         tgt["input_ids"].squeeze(0),
-            "source_text":    r["source"],
-            "target_text":    r["target"],
-        }
+        return self.samples[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -164,38 +209,28 @@ class QADataset(Dataset):
 
     # ------------------------------------------------------------------
     def _build(self, path: str):
+        cache_path = _cache_file(path, "qa", self.tokenizer, self.max_length)
+        if os.path.isfile(cache_path):
+            print(f"[QADataset] loading cache: {cache_path}")
+            self.samples = torch.load(cache_path, map_location="cpu")
+            print(f"[QADataset] loaded cache: {cache_path} ({len(self.samples)} samples)")
+            return
+
         raw = _load_rows(path, self.QA_COLS)
 
         n_bad_char  = 0   # start_char mismatch / invalid
         n_truncated = 0   # answer truncated by max_length
 
-        for row in tqdm(raw, desc=f"[QADataset] Tokenizing {path}", unit="sample"):
-            sample_id   = row["id"]
-            context     = row["context"]
-            question    = row["question"]
-            answer_text = row["answer_text"]
-            answers     = _parse_answers(row["answers"])
-
-            # ── Read pre-computed start_char from CSV ───────────────────
-            try:
-                start_char = int(row["start_char"])
-            except (ValueError, TypeError):
-                n_bad_char += 1
-                continue
-
-            end_char = start_char + len(answer_text)  # exclusive
-
-            # Sanity check: context[start_char:end_char] must match answer
-            actual = context[start_char:end_char]
-            if actual.lower() != answer_text.lower():
-                n_bad_char += 1
-                continue
-
-            # ── Tokenize (question, context) jointly ────────────────────
-            # truncation="only_second" → question is never cut, only context
+        tok_bs = 128
+        print(f"[QADataset] Tokenizing in batches of {tok_bs}...")
+        for start in tqdm(range(0, len(raw), tok_bs), desc=f"[QADataset] Tokenizing {path}", unit="batch"):
+            end = min(start + tok_bs, len(raw))
+            chunk = raw[start:end]
+            questions = [r["question"] for r in chunk]
+            contexts = [r["context"] for r in chunk]
             enc = self.tokenizer(
-                question,
-                context,
+                questions,
+                contexts,
                 max_length=self.max_length,
                 truncation="only_second",
                 padding="max_length",
@@ -203,70 +238,89 @@ class QADataset(Dataset):
                 return_tensors="pt",
             )
 
-            # sequence_ids: 0=question, 1=context, None=special/padding
-            seq_ids        = enc.sequence_ids(0)
-            offset_mapping = enc["offset_mapping"].squeeze(0).tolist()
+            for local_idx, row in enumerate(chunk):
+                sample_id   = row["id"]
+                context     = row["context"]
+                answer_text = row["answer_text"]
+                answers     = _parse_answers(row["answers"])
 
-            # ── Find first/last context token indices ───────────────────
-            ctx_start = next(
-                (i for i, s in enumerate(seq_ids) if s == 1), None
-            )
-            ctx_end = next(
-                (i for i in range(len(seq_ids) - 1, -1, -1) if seq_ids[i] == 1),
-                None,
-            )
+                # ── Read pre-computed start_char from CSV ───────────────────
+                try:
+                    start_char = int(row["start_char"])
+                except (ValueError, TypeError):
+                    n_bad_char += 1
+                    continue
 
-            if ctx_start is None or ctx_end is None:
-                n_truncated += 1
-                continue
+                end_char = start_char + len(answer_text)  # exclusive
 
-            # ── Check answer is not truncated away ──────────────────────
-            ctx_char_lo = offset_mapping[ctx_start][0]
-            ctx_char_hi = offset_mapping[ctx_end][1]
-            if not (ctx_char_lo <= start_char and ctx_char_hi >= end_char):
-                n_truncated += 1
-                continue
+                # Sanity check: context[start_char:end_char] must match answer
+                actual = context[start_char:end_char]
+                if actual.lower() != answer_text.lower():
+                    n_bad_char += 1
+                    continue
 
-            # ── Map start_char/end_char → token indices ─────────────────
-            # tok_start: last context token whose char_start <= start_char
-            tok_start = ctx_start
-            for i in range(ctx_start, ctx_end + 1):
-                if offset_mapping[i][0] <= start_char:
-                    tok_start = i
-                else:
-                    break
+                # sequence_ids: 0=question, 1=context, None=special/padding
+                seq_ids = enc.encodings[local_idx].sequence_ids
+                offset_mapping = enc["offset_mapping"][local_idx].tolist()
 
-            # tok_end: first context token whose char_end >= end_char
-            tok_end = ctx_end
-            for i in range(ctx_end, ctx_start - 1, -1):
-                if offset_mapping[i][1] >= end_char:
-                    tok_end = i
-                else:
-                    break
+                # ── Find first/last context token indices ───────────────────
+                ctx_start = next((i for i, s in enumerate(seq_ids) if s == 1), None)
+                ctx_end = next(
+                    (i for i in range(len(seq_ids) - 1, -1, -1) if seq_ids[i] == 1),
+                    None,
+                )
 
-            # ── Global attention mask (Longformer requirement) ───────────
-            # Longformer needs global attention on question tokens so that
-            # every context token can attend to the question via global path.
-            input_ids   = enc["input_ids"].squeeze(0)
-            global_attn = torch.zeros_like(input_ids)
-            for i, sid in enumerate(seq_ids):
-                if sid == 0 or i == 0:   # question token or CLS
-                    global_attn[i] = 1
+                if ctx_start is None or ctx_end is None:
+                    n_truncated += 1
+                    continue
 
-            # Ensure answers always includes the primary answer_text
-            all_answers = list(dict.fromkeys([answer_text] + answers))
+                # ── Check answer is not truncated away ──────────────────────
+                ctx_char_lo = offset_mapping[ctx_start][0]
+                ctx_char_hi = offset_mapping[ctx_end][1]
+                if not (ctx_char_lo <= start_char and ctx_char_hi >= end_char):
+                    n_truncated += 1
+                    continue
 
-            self.samples.append({
-                "input_ids":             input_ids,
-                "attention_mask":        enc["attention_mask"].squeeze(0),
-                "global_attention_mask": global_attn,
-                "labels":                torch.tensor(
-                    [tok_start, tok_end], dtype=torch.long
-                ),
-                "answer_text": answer_text,   # primary gold (for loss display)
-                "answers":     all_answers,   # all aliases (for EM/F1 eval)
-                "sample_id":   sample_id,
-            })
+                # ── Map start_char/end_char → token indices ─────────────────
+                tok_start = ctx_start
+                for i in range(ctx_start, ctx_end + 1):
+                    if offset_mapping[i][0] <= start_char:
+                        tok_start = i
+                    else:
+                        break
+
+                tok_end = ctx_end
+                for i in range(ctx_end, ctx_start - 1, -1):
+                    if offset_mapping[i][1] >= end_char:
+                        tok_end = i
+                    else:
+                        break
+
+                # ── Global attention mask (Longformer requirement) ───────────
+                input_ids = enc["input_ids"][local_idx]
+                global_attn = torch.zeros_like(input_ids)
+                for i, sid in enumerate(seq_ids):
+                    if sid == 0 or i == 0:   # question token or CLS
+                        global_attn[i] = 1
+
+                context_mask = torch.tensor(
+                    [1 if sid == 1 else 0 for sid in seq_ids], dtype=torch.long
+                )
+                context_mask = context_mask * enc["attention_mask"][local_idx]
+
+                # Ensure answers always includes the primary answer_text
+                all_answers = list(dict.fromkeys([answer_text] + answers))
+
+                self.samples.append({
+                    "input_ids":             input_ids,
+                    "attention_mask":        enc["attention_mask"][local_idx],
+                    "global_attention_mask": global_attn,
+                    "context_mask":          context_mask,
+                    "labels":                torch.tensor([tok_start, tok_end], dtype=torch.long),
+                    "answer_text": answer_text,
+                    "answers":     all_answers,
+                    "sample_id":   sample_id,
+                })
 
         total = len(raw)
         kept  = len(self.samples)
@@ -275,6 +329,9 @@ class QADataset(Dataset):
             f"  total={total}  kept={kept}  "
             f"dropped_bad_char={n_bad_char}  dropped_truncated={n_truncated}"
         )
+
+        torch.save(self.samples, cache_path)
+        print(f"[QADataset] saved cache: {cache_path}")
 
     # ------------------------------------------------------------------
     def __len__(self):
@@ -290,7 +347,7 @@ class QADataset(Dataset):
 
 
 def get_dataloader(task, path, tokenizer, batch_size=2, max_length=4096,
-                   shuffle=True, num_workers=0):
+                   shuffle=True, num_workers=2):
     if task == "qa":
         ds = QADataset(path, tokenizer, max_length)
     elif task == "docmt":
@@ -307,5 +364,13 @@ def get_dataloader(task, path, tokenizer, batch_size=2, max_length=4096,
                 out[k] = [b[k] for b in batch]
         return out
 
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                      num_workers=num_workers, collate_fn=collate)
+    use_pin = torch.cuda.is_available()
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate,
+        pin_memory=use_pin,
+        persistent_workers=(num_workers > 0),
+    )

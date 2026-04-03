@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from argparse import Namespace
 from typing import Any, Dict, List
 
@@ -25,10 +26,17 @@ from src.metrics import (
     compute_bleu, compute_comet, compute_efficiency,
     compute_em, compute_f1,
     compute_em_aliases, compute_f1_aliases,
-    compute_rouge, compute_routing_stats,
+    compute_faithfulness, compute_rouge, compute_routing_stats,
 )
 from src.modeling import anti_collapse_loss, null_route_loss
 from transformers import get_linear_schedule_with_warmup
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def qa_loss(start_logits, end_logits, start_pos, end_pos):
@@ -41,6 +49,7 @@ def qa_loss(start_logits, end_logits, start_pos, end_pos):
 # ===================================================================== #
 
 def train(args: Namespace):
+    set_seed(getattr(args, "seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     is_la = (args.model == "longattention")
     use_amp = (device.type == "cuda")
@@ -78,18 +87,16 @@ def train(args: Namespace):
     print(f"  → Accumulation steps: {accum_steps} (Effective batch size: {args.batch_size * accum_steps})")
 
     # 4. Learning Rate Scheduler có Warmup (10% tổng số bước)
-    num_training_steps = (len(loader) // accum_steps) * args.epochs
+    num_training_steps = ((len(loader) + accum_steps - 1) // accum_steps) * args.epochs
     num_warmup_steps = int(num_training_steps * 0.1)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps
     )
 
     # Mixed precision scaler
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # DocMT loss
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100
-    docmt_criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+    # DocMT loss handled by seq2seq models
 
     # Loggers
     os.makedirs(args.output_dir, exist_ok=True)
@@ -104,48 +111,55 @@ def train(args: Namespace):
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss, nb = 0.0, 0
+        epoch_alphas: List[float] = []
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
 
         for step_idx, batch in enumerate(pbar):
             ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
+            context_mask = batch.get("context_mask")
+            if context_mask is not None:
+                context_mask = context_mask.to(device)
             
             global_attn = batch.get("global_attention_mask")
             if global_attn is not None:
                 global_attn = global_attn.to(device)
 
             # ---- Forward with mixed precision ----
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                if is_la:
-                    out, layer_infos = model(input_ids=ids, attention_mask=mask)
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                if args.task == "docmt":
+                    out = model(input_ids=ids, attention_mask=mask, labels=labels)
+                    task_l = out["loss"]
+                    layer_infos = out.get("layer_infos") if isinstance(out, dict) else None
                 else:
-                    out = model(input_ids=ids, attention_mask=mask, global_attention_mask=global_attn)
-                    layer_infos = None
+                    if is_la:
+                        out, layer_infos = model(input_ids=ids, attention_mask=mask)
+                    else:
+                        out = model(input_ids=ids, attention_mask=mask, global_attention_mask=global_attn)
+                        layer_infos = None
 
-                # Task loss
-                if args.task == "qa":
+                    # Task loss
                     sl, el = out["start_logits"], out["end_logits"]
+                    if context_mask is not None:
+                        mask_val = torch.finfo(sl.dtype).min
+                        sl = sl.masked_fill(context_mask == 0, mask_val)
+                        el = el.masked_fill(context_mask == 0, mask_val)
                     sp = labels[:, 0]
                     ep = labels[:, 1]
                     sp = torch.where(sp >= 0, sp.clamp(max=ids.size(1) - 1), sp)
                     ep = torch.where(ep >= 0, ep.clamp(max=ids.size(1) - 1), ep)
                     task_l = qa_loss(sl, el, sp, ep)
-                else:
-                    logits = out["logits"]
-                    shift_l = logits[:, :-1, :].contiguous()
-                    shift_t = labels[:, 1:].contiguous()
-                    task_l = docmt_criterion(shift_l.view(-1, shift_l.size(-1)), shift_t.view(-1))
 
                 # Regularization (LongAttention only)
-                loss = task_l
+                raw_loss = task_l
                 if is_la and layer_infos:
                     ac = anti_collapse_loss(layer_infos)
                     nr = null_route_loss(layer_infos)
-                    loss = loss + args.anti_collapse_weight * ac + args.null_route_weight * nr
-                
+                    raw_loss = raw_loss + args.anti_collapse_weight * ac + args.null_route_weight * nr
+
                 # Chia loss cho accum_steps vì PyTorch cộng dồn thay vì lấy trung bình
-                loss = loss / accum_steps
+                loss = raw_loss / accum_steps
 
             # ---- Backward with scaler ----
             scaler.scale(loss).backward()
@@ -158,37 +172,43 @@ def train(args: Namespace):
                 scheduler.step()
                 optimizer.zero_grad()
                 step += 1
-            total_loss += loss.item()
+            total_loss += raw_loss.item()
             nb += 1
 
             # Log
-            entry = {"loss": loss.item(), "task_loss": task_l.item()}
+            entry = {"loss": raw_loss.item(), "task_loss": task_l.item()}
             if is_la and layer_infos:
                 entry["anti_collapse"] = ac.item()
                 entry["null_route"] = nr.item()
+                alphas = [float(info["alpha"].detach().cpu().item()) for info in layer_infos if "alpha" in info]
+                if alphas:
+                    entry["alpha_mean"] = float(sum(alphas) / len(alphas))
+                    epoch_alphas.extend(alphas)
                 rt.record(layer_infos, step)
                 st.record(layer_infos, step)
             ml.log_step(entry, step)
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg = total_loss / max(nb, 1)
-        print(f"  → Epoch {epoch}  avg_loss={avg:.4f}")
-
-        # ---- Eval on test set after each epoch ----
-        eval_results = eval_epoch(model, tokenizer, args, device, use_amp, is_la)
-        epoch_log = {"avg_loss": avg, **eval_results}
-        ml.log_epoch(epoch_log, epoch)
-        if args.task == "qa":
-            em = eval_results.get("em", 0)
-            f1 = eval_results.get("f1", 0)
-            print(f"    [test] EM={em:.2f}  F1={f1:.2f}")
+        if epoch_alphas:
+            alpha_mean_epoch = sum(epoch_alphas) / len(epoch_alphas)
+            alpha_min = min(epoch_alphas)
+            alpha_max = max(epoch_alphas)
+            print(
+                f"  → Epoch {epoch}  avg_loss={avg:.4f}  "
+                f"alpha_mean_epoch={alpha_mean_epoch:.6f}  "
+                f"alpha_min={alpha_min:.6f}  alpha_max={alpha_max:.6f}"
+            )
         else:
-            print(f"    [test] BLEU={eval_results.get('bleu', 0):.2f}")
+            print(f"  → Epoch {epoch}  avg_loss={avg:.4f}")
+
+        # Log only training loss per epoch; eval runs in evaluate()
+        ml.log_epoch({"avg_loss": avg}, epoch)
 
         # Checkpoint
         ckpt = os.path.join(args.output_dir, f"ckpt_epoch{epoch}.pt")
         torch.save({"epoch": epoch, "model": model.state_dict(),
-                     "eval": eval_results, "args": vars(args)}, ckpt)
+                 "args": vars(args)}, ckpt)
 
     # Save logs
     ml.save("train_metrics.json")
@@ -198,71 +218,11 @@ def train(args: Namespace):
 
 
 # ===================================================================== #
-#  Eval after each epoch (lightweight, no efficiency profiling)          #
-# ===================================================================== #
-
-def eval_epoch(model, tokenizer, args, device, use_amp, is_la):
-    """Quick eval on test set — returns EM/F1 or BLEU dict."""
-    model.eval()
-    test_path = os.path.join(args.dataset_path, "test.csv")
-    if not os.path.isfile(test_path):
-        model.train()
-        return {}
-
-    loader = get_dataloader(args.task, test_path, tokenizer,
-                            batch_size=args.batch_size, max_length=args.max_length, shuffle=False)
-
-    preds, refs, aliases, srcs = [], [], [], []
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_amp):
-        for batch in tqdm(loader, desc="Eval (Epoch)"):
-            ids = batch["input_ids"].to(device)
-            mask = batch["attention_mask"].to(device)
-            global_attn = batch.get("global_attention_mask")
-            if global_attn is not None: global_attn = global_attn.to(device)
-
-            if is_la:
-                out, _ = model(input_ids=ids, attention_mask=mask)
-            else:
-                out = model(input_ids=ids, attention_mask=mask, global_attention_mask=global_attn)
-
-            if args.task == "qa":
-                si = out["start_logits"].argmax(-1)
-                ei = out["end_logits"].argmax(-1)
-                for b in range(ids.size(0)):
-                    s, e = si[b].item(), ei[b].item()
-                    if e < s: e = s
-                    preds.append(tokenizer.decode(ids[b, s:e+1], skip_special_tokens=True))
-                refs.extend(batch.get("answer_text", [""] * ids.size(0)))
-                # answers = List[List[str]] — all aliases per sample
-                batch_aliases = batch.get("answers", None)
-                if batch_aliases is not None:
-                    aliases.extend(batch_aliases)
-                else:
-                    aliases.extend([[r] for r in batch.get("answer_text", [""] * ids.size(0))])
-            else:
-                pid = out["logits"].argmax(-1)
-                preds.extend(tokenizer.batch_decode(pid, skip_special_tokens=True))
-                refs.extend(batch.get("target_text", [""] * ids.size(0)))
-                srcs.extend(batch.get("source_text", [""] * ids.size(0)))
-
-    results = {}
-    if args.task == "qa":
-        # Use alias-aware metrics (correct for TriviaQA)
-        results.update(compute_em_aliases(preds, aliases))
-        results.update(compute_f1_aliases(preds, aliases))
-        results.update(compute_rouge(preds, refs))
-    else:
-        results.update(compute_bleu(preds, refs))
-
-    model.train()
-    return results
-
-
-# ===================================================================== #
 #  Evaluate                                                              #
 # ===================================================================== #
 
 def evaluate(args: Namespace):
+    set_seed(getattr(args, "seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     is_la = (args.model == "longattention")
     print(f"\n[EVAL] model={args.model}  backbone={args.backbone}  task={args.task}  device={device}")
@@ -285,28 +245,62 @@ def evaluate(args: Namespace):
     model.eval()
 
     test_path = os.path.join(args.dataset_path, "test.csv")
+    if not os.path.isfile(test_path):
+        print(f"  WARNING: test.csv not found at {test_path}")
+        return {}
     loader = get_dataloader(args.task, test_path, tokenizer,
                             batch_size=args.batch_size, max_length=args.max_length, shuffle=False)
 
     preds, refs, aliases, srcs = [], [], [], []
+    selected_segments, gold_segments = [], []
     all_infos = []
+    sample_ids = None
+    sample_mask = None
 
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+    with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
         for batch in tqdm(loader, desc="Eval"):
             ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)
+            context_mask = batch.get("context_mask")
+            if context_mask is not None:
+                context_mask = context_mask.to(device)
+            if sample_ids is None:
+                sample_ids = ids[:1].detach().clone()
+                sample_mask = mask[:1].detach().clone()
             global_attn = batch.get("global_attention_mask")
             if global_attn is not None: global_attn = global_attn.to(device)
 
-            if is_la:
-                out, li = model(input_ids=ids, attention_mask=mask)
-                all_infos.append({k: v.cpu() for k, v in li[-1].items()})
+            if args.task == "docmt":
+                gen_ids = model.generate(
+                    input_ids=ids,
+                    attention_mask=mask,
+                    max_length=min(args.max_length, getattr(args, "gen_max_length", 256)),
+                )
+                preds.extend(tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
+                refs.extend(batch.get("target_text", [""] * ids.size(0)))
+                srcs.extend(batch.get("source_text", [""] * ids.size(0)))
+                inner = getattr(model, "model", None)
+                if inner is not None:
+                    enc_infos = getattr(inner.model.encoder, "_last_infos", None)
+                    if enc_infos:
+                        # Memory optimization: Keep only current batch info
+                        all_infos = [{k: v.cpu() for k, v in info.items()} for info in enc_infos]
             else:
-                out = model(input_ids=ids, attention_mask=mask, global_attention_mask=global_attn)
+                if is_la:
+                    out, li = model(input_ids=ids, attention_mask=mask)
+                    # Memory optimization: Keep only current batch info to avoid RAM OOM
+                    all_infos = [{k: v.cpu() for k, v in layer.items()} for layer in li]
+                    last_info = li[-1]
+                else:
+                    out = model(input_ids=ids, attention_mask=mask, global_attention_mask=global_attn)
 
-            if args.task == "qa":
-                si = out["start_logits"].argmax(-1)
-                ei = out["end_logits"].argmax(-1)
+                sl, el = out["start_logits"], out["end_logits"]
+                if context_mask is not None:
+                    mask_val = torch.finfo(sl.dtype).min
+                    sl = sl.masked_fill(context_mask == 0, mask_val)
+                    el = el.masked_fill(context_mask == 0, mask_val)
+                si = sl.argmax(-1)
+                ei = el.argmax(-1)
                 for b in range(ids.size(0)):
                     s, e = si[b].item(), ei[b].item()
                     if e < s: e = s
@@ -317,11 +311,24 @@ def evaluate(args: Namespace):
                     aliases.extend(batch_aliases)
                 else:
                     aliases.extend([[r] for r in batch.get("answer_text", [""]*ids.size(0))])
-            else:
-                pid = out["logits"].argmax(-1)
-                preds.extend(tokenizer.batch_decode(pid, skip_special_tokens=True))
-                refs.extend(batch.get("target_text", [""]*ids.size(0)))
-                srcs.extend(batch.get("source_text", [""]*ids.size(0)))
+
+                if is_la:
+                    # Faithfulness: compare routed segments vs gold answer segments
+                    topk_idx = last_info["topk_idx"]  # (B,H,L,K)
+                    gold = batch["labels"].to(device)
+                    for b in range(ids.size(0)):
+                        gs, ge = gold[b, 0].item(), gold[b, 1].item()
+                        if ge < gs:
+                            ge = gs
+                        seg_lo = gs // args.segment_size
+                        seg_hi = ge // args.segment_size
+                        gold_segments.append(list(range(seg_lo, seg_hi + 1)))
+
+                        sel = set()
+                        for t in range(gs, ge + 1):
+                            segs = topk_idx[b, :, t, :].reshape(-1)
+                            sel.update([int(x) for x in segs.tolist()])
+                        selected_segments.append(sorted(sel))
 
     # Metrics
     results: Dict[str, Any] = {"model": args.model, "backbone": args.backbone, "task": args.task}
@@ -330,17 +337,22 @@ def evaluate(args: Namespace):
         results.update(compute_em_aliases(preds, aliases))
         results.update(compute_f1_aliases(preds, aliases))
         results.update(compute_rouge(preds, refs))
+        if is_la and selected_segments and gold_segments:
+            results.update(compute_faithfulness(selected_segments, gold_segments))
     else:
         results.update(compute_bleu(preds, refs))
         results.update(compute_comet(preds, refs, srcs))
 
     # Efficiency
-    sample = torch.randint(0, 100, (1, min(args.max_length, 512)), device=device)
-    results.update(compute_efficiency(model, sample))
+    if sample_ids is None:
+        sample_ids = torch.randint(0, 100, (1, min(args.max_length, 512)), device=device)
+        sample_mask = torch.ones_like(sample_ids)
+    results.update(compute_efficiency(model, sample_ids, attention_mask=sample_mask))
 
     # Routing (LongAttention only)
     if all_infos:
-        results["routing"] = compute_routing_stats(all_infos[-1:])
+        # all_infos contains info for all layers of the last batch
+        results["routing"] = compute_routing_stats(all_infos)
 
     out_path = os.path.join(args.output_dir, "eval_summary.json")
     with open(out_path, "w") as f:

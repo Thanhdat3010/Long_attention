@@ -54,6 +54,8 @@ class RoutingTracker:
                 "gate_active_frac": float((g > 0.5).float().mean()),
                 "type_dist": tm.mean(dim=(0, 1, 2)).tolist(),
             }
+            if "alpha" in info:
+                entry["alpha"] = float(info["alpha"].detach().cpu().item())
             if "topk_w" in info:
                 tw = info["topk_w"]
                 entry["routing_entropy"] = float(-(tw * (tw + 1e-8).log()).sum(-1).mean())

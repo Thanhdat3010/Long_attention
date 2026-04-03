@@ -40,20 +40,37 @@ class SegmentSummarizer(nn.Module):
         super().__init__()
         self.segment_size = segment_size
 
-    def forward(self, keys, values):
-        """(B,H,L,D) → sk(B,H,S,D), sv(B,H,S,D), num_segments"""
+    def forward(self, keys, values, attention_mask=None):
+        """(B,H,L,D) → sk(B,H,S,D), sv(B,H,S,D), num_segments, seg_mask"""
         B, H, L, D = keys.shape
         ss = self.segment_size
         pad = (ss - L % ss) % ss
         if pad > 0:
             keys = F.pad(keys, (0, 0, 0, pad))
             values = F.pad(values, (0, 0, 0, pad))
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(1).unsqueeze(-1)  # (B,1,L,1)
+            if pad > 0:
+                mask = F.pad(mask, (0, 0, 0, pad))
+        else:
+            mask = None
+
         n = keys.shape[2] // ss
-        return (
-            keys.reshape(B, H, n, ss, D).mean(3),    # (B,H,S,D)
-            values.reshape(B, H, n, ss, D).mean(3),   # (B,H,S,D)
-            n,
-        )
+        k = keys.reshape(B, H, n, ss, D)
+        v = values.reshape(B, H, n, ss, D)
+
+        if mask is None:
+            sk = k.mean(3)
+            sv = v.mean(3)
+            seg_mask = None
+        else:
+            m = mask.reshape(B, 1, n, ss, 1)
+            denom = m.sum(3).clamp(min=1.0)  # (B,1,S,1)
+            sk = (k * m).sum(3) / denom
+            sv = (v * m).sum(3) / denom
+            seg_mask = (denom.squeeze(-1).squeeze(1) > 0)
+
+        return sk, sv, n, seg_mask
 
 
 # ===================================================================== #
@@ -68,7 +85,7 @@ class NecessityRouter(nn.Module):
         )
         self.type_proj = nn.Linear(d_head, num_types)
 
-    def forward(self, queries, seg_keys, num_segments, layer_ratio=0.5, top_k=4):
+    def forward(self, queries, seg_keys, num_segments, layer_ratio=0.5, top_k=4, seg_mask=None):
         """
         Returns:
             gate:      (B,H,L,1)
@@ -82,6 +99,9 @@ class NecessityRouter(nn.Module):
         # Scale first to prevent FP16 overflow in dot product
         q_scaled = queries / math.sqrt(D)
         seg_logits = torch.einsum("bhld,bhsd->bhls", q_scaled, seg_keys)
+        if seg_mask is not None:
+            mask_val = torch.finfo(seg_logits.dtype).min
+            seg_logits = seg_logits.masked_fill(~seg_mask.unsqueeze(1).unsqueeze(2), mask_val)
         K = min(top_k, num_segments)
         topk_vals, topk_idx = seg_logits.topk(K, dim=-1)
 
@@ -113,7 +133,10 @@ class LocalAttention(nn.Module):
             attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & pad_mask
 
         # SDPA handles this efficiently (Math backend for boolean mask)
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        if attention_mask is not None:
+            out = out * attention_mask.unsqueeze(1).unsqueeze(-1)
+        return out
 
 
 # ===================================================================== #
@@ -197,6 +220,8 @@ class LongAttentionLayer(nn.Module):
         top_k: int = 4,
         ff_mult: int = 4,
         dropout: float = 0.1,
+        alpha_init: float = 0.02,
+        gate_bias_init: float = 0.0,
     ):
         super().__init__()
         assert d_model % num_heads == 0
@@ -217,6 +242,9 @@ class LongAttentionLayer(nn.Module):
             nn.Linear(d_model, d_model * ff_mult), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(d_model * ff_mult, d_model), nn.Dropout(dropout),
         )
+        # ReZero-style scaling for long-range branch (learnable, starts small for stability)
+        self.alpha_long = nn.Parameter(torch.tensor(float(alpha_init)))
+        nn.init.constant_(self.router.gate_proj[-1].bias, float(gate_bias_init))
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout_layer = nn.Dropout(dropout)
@@ -233,12 +261,14 @@ class LongAttentionLayer(nn.Module):
         a_local = self.local_attn(q, k, v, attention_mask=attention_mask)
 
         # 3. Long-range branch (summary-level)
-        sk, sv, ns = self.seg_summarizer(k, v)
-        gate, topk_idx, topk_w, type_mask = self.router(q, sk, ns, layer_ratio, self.top_k)
+        sk, sv, ns, seg_mask = self.seg_summarizer(k, v, attention_mask=attention_mask)
+        gate, topk_idx, topk_w, type_mask = self.router(
+            q, sk, ns, layer_ratio, self.top_k, seg_mask=seg_mask
+        )
         a_long = self.long_attn(q, sk, sv, topk_idx, topk_w, type_mask)
 
         # 4. Combine & Post-LN 1 (Attention residual)
-        combined = a_local + gate * a_long
+        combined = a_local + self.alpha_long * gate * a_long
         combined = combined.transpose(1, 2).reshape(B, L, D)
         attn_out = self.norm1(hidden_states + self.dropout_layer(self.out_proj(combined)))
 
@@ -261,6 +291,7 @@ class LongAttentionLayer(nn.Module):
             "topk_idx": topk_idx,
             "topk_w": topk_w,
             "type_mask": type_mask,
+            "alpha": self.alpha_long,
         }
         return x, info
 

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -57,6 +59,20 @@ class BaselineModel(nn.Module):
             return {"logits": self.lm_head(h)}
 
 
+class Seq2SeqBaseline(nn.Module):
+    def __init__(self, backbone_name: str):
+        super().__init__()
+        from transformers import AutoModelForSeq2SeqLM
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(backbone_name)
+
+    def forward(self, input_ids, attention_mask=None, labels=None, **kw):
+        out = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        return {"loss": out.loss, "logits": out.logits}
+
+    def generate(self, **kw):
+        return self.model.generate(**kw)
+
+
 # ===================================================================== #
 #  LongAttentionModel                                                    #
 # ===================================================================== #
@@ -78,6 +94,8 @@ class LongAttentionModel(nn.Module):
         segment_size: int = 64,
         top_k: int = 4,
         gradient_checkpoint: bool = False,
+        alpha_init: float = 0.02,
+        gate_bias_init: float = 0.0,
     ):
         super().__init__()
         from transformers import AutoModel
@@ -109,6 +127,8 @@ class LongAttentionModel(nn.Module):
                 top_k=top_k,
                 ff_mult=4,
                 dropout=dropout,
+                alpha_init=alpha_init,
+                gate_bias_init=gate_bias_init,
             )
             for _ in range(self.num_layers)
         ])
@@ -126,10 +146,6 @@ class LongAttentionModel(nn.Module):
                 if i >= len(orig_layers): break
                 orig = orig_layers[i]
                 
-                # BUG FIX: Setup router to start mostly OPEN (+1.0 bias -> sigmoid(1.0) = ~0.73)
-                # If initialized to -5.0, sigmoid output is ~0.006 -> gate is entirely dead and receives no gradients!
-                nn.init.constant_(la_layer.router.gate_proj[-1].bias, 1.0)
-
                 try:
                     if hasattr(orig, "attention"):
                         attn = orig.attention
@@ -200,18 +216,154 @@ class LongAttentionModel(nn.Module):
         return out, layer_infos
 
 
+class LongAttentionBartEncoder(nn.Module):
+    def __init__(
+        self,
+        bart_encoder,
+        num_types: int = 4,
+        window_size: int = 256,
+        segment_size: int = 64,
+        top_k: int = 4,
+        gradient_checkpoint: bool = False,
+        alpha_init: float = 0.02,
+        gate_bias_init: float = 0.0,
+    ):
+        super().__init__()
+        cfg = bart_encoder.config
+        self.config = cfg
+        self.embed_tokens = bart_encoder.embed_tokens
+        self.embed_positions = getattr(bart_encoder, "embed_positions", None)
+        self.layernorm_embedding = getattr(bart_encoder, "layernorm_embedding", None)
+        self.dropout = getattr(cfg, "dropout", 0.1)
+        self.embed_scale = math.sqrt(cfg.d_model) if getattr(cfg, "scale_embedding", False) else 1.0
+        self.hidden_size = cfg.d_model
+        self.num_layers = cfg.encoder_layers
+        num_heads = cfg.encoder_attention_heads
+
+        self.layers = nn.ModuleList([
+            LongAttentionLayer(
+                d_model=self.hidden_size,
+                num_heads=num_heads,
+                num_types=num_types,
+                window_size=window_size,
+                segment_size=segment_size,
+                top_k=top_k,
+                ff_mult=4,
+                dropout=cfg.dropout,
+                alpha_init=alpha_init,
+                gate_bias_init=gate_bias_init,
+            )
+            for _ in range(self.num_layers)
+        ])
+
+        if gradient_checkpoint:
+            for layer in self.layers:
+                layer.use_checkpoint = True
+
+        self.final_norm = nn.LayerNorm(self.hidden_size)
+        self._last_infos = None
+
+    def forward(self, input_ids=None, attention_mask=None, **kw):
+        if input_ids is None:
+            raise ValueError("LongAttentionBartEncoder requires input_ids")
+
+        x = self.embed_tokens(input_ids) * self.embed_scale
+        if self.embed_positions is not None:
+            x = x + self.embed_positions(input_ids)
+        if self.layernorm_embedding is not None:
+            x = self.layernorm_embedding(x)
+        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+
+        layer_infos = []
+        for idx, layer in enumerate(self.layers):
+            ratio = idx / max(self.num_layers - 1, 1)
+            x, info = layer(x, layer_ratio=ratio, attention_mask=attention_mask)
+            layer_infos.append(info)
+
+        x = self.final_norm(x)
+        self._last_infos = layer_infos
+
+        from transformers.modeling_outputs import BaseModelOutput
+        return BaseModelOutput(last_hidden_state=x)
+
+
+class LongAttentionSeq2SeqModel(nn.Module):
+    def __init__(
+        self,
+        backbone_name: str,
+        num_types: int = 4,
+        window_size: int = 256,
+        segment_size: int = 64,
+        top_k: int = 4,
+        gradient_checkpoint: bool = False,
+        alpha_init: float = 0.02,
+        gate_bias_init: float = 0.0,
+    ):
+        super().__init__()
+        from transformers import AutoModelForSeq2SeqLM
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(backbone_name)
+        if getattr(self.model.config, "model_type", "") != "bart":
+            raise ValueError("LongAttentionSeq2SeqModel currently supports BART backbones only.")
+
+        encoder = self.model.model.encoder
+        self.model.model.encoder = LongAttentionBartEncoder(
+            encoder,
+            num_types=num_types,
+            window_size=window_size,
+            segment_size=segment_size,
+            top_k=top_k,
+            gradient_checkpoint=gradient_checkpoint,
+            alpha_init=alpha_init,
+            gate_bias_init=gate_bias_init,
+        )
+
+    def forward(self, input_ids, attention_mask=None, labels=None, **kw):
+        out = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        layer_infos = getattr(self.model.model.encoder, "_last_infos", None)
+        return {"loss": out.loss, "logits": out.logits, "layer_infos": layer_infos}
+
+    def generate(self, **kw):
+        return self.model.generate(**kw)
+
+
 # ===================================================================== #
 #  Factory                                                               #
 # ===================================================================== #
 
 def build_model(args) -> nn.Module:
-    if args.model == "baseline":
+    if args.task == "docmt":
+        if args.model == "baseline":
+            model = Seq2SeqBaseline(args.backbone)
+            print(f"[model] Seq2SeqBaseline | backbone={args.backbone} | task={args.task}")
+        elif args.model == "longattention":
+            top_k = getattr(args, "top_k", 4)
+            grad_ckpt = getattr(args, "gradient_checkpoint", False)
+            alpha_init = getattr(args, "alpha_init", 0.02)
+            gate_bias_init = getattr(args, "gate_bias_init", 0.0)
+            model = LongAttentionSeq2SeqModel(
+                backbone_name=args.backbone,
+                num_types=args.num_types,
+                window_size=args.window_size,
+                segment_size=args.segment_size,
+                top_k=top_k,
+                gradient_checkpoint=grad_ckpt,
+                alpha_init=alpha_init,
+                gate_bias_init=gate_bias_init,
+            )
+            print(f"[model] LongAttentionSeq2SeqModel | backbone={args.backbone} | task={args.task}")
+            print(f"        window={args.window_size} segment={args.segment_size} types={args.num_types} top_k={top_k} grad_ckpt={grad_ckpt}")
+        else:
+            raise ValueError(f"Unknown: {args.model}")
+
+    elif args.model == "baseline":
         model = BaselineModel(args.backbone, args.task)
         print(f"[model] BaselineModel | backbone={args.backbone} | task={args.task}")
 
     elif args.model == "longattention":
         top_k = getattr(args, "top_k", 4)
         grad_ckpt = getattr(args, "gradient_checkpoint", False)
+        alpha_init = getattr(args, "alpha_init", 0.02)
+        gate_bias_init = getattr(args, "gate_bias_init", 0.0)
         model = LongAttentionModel(
             backbone_name=args.backbone,
             task=args.task,
@@ -220,6 +372,8 @@ def build_model(args) -> nn.Module:
             segment_size=args.segment_size,
             top_k=top_k,
             gradient_checkpoint=grad_ckpt,
+            alpha_init=alpha_init,
+            gate_bias_init=gate_bias_init,
         )
         print(f"[model] LongAttentionModel | backbone={args.backbone} | task={args.task}")
         print(f"        window={args.window_size} segment={args.segment_size} types={args.num_types} top_k={top_k} grad_ckpt={grad_ckpt}")

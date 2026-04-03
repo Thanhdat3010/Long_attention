@@ -23,10 +23,10 @@ Usage examples:
   │      --backbone google/bigbird-roberta-base \                      │
   │      --dataset_path data/qa --output_dir outputs/longatt_bigbird   │
   │                                                                    │
-  │  EXPERIMENT 4: DocMT with RoBERTa                                  │
+    │  EXPERIMENT 4: DocMT with BART                                     │
   │                                                                    │
-  │  python main.py --mode train --task docmt --model longattention \  │
-  │      --backbone roberta-base \                                     │
+    │  python main.py --mode train --task docmt --model longattention \  │
+    │      --backbone facebook/bart-base \                               │
   │      --dataset_path data/docmt --output_dir outputs/longatt_docmt  │
   │                                                                    │
   │  EVALUATE any experiment:                                          │
@@ -90,12 +90,19 @@ def main():
                    help="Top-K segments to route to (lower=less memory, default 4)")
     p.add_argument("--gradient_checkpoint", action="store_true",
                    help="Enable gradient checkpointing (saves ~2-3× memory, slower)")
+    p.add_argument("--alpha_init", type=float, default=0.02,
+             help="Initial ReZero scale for long-range branch")
+    p.add_argument("--gate_bias_init", type=float, default=0.0,
+             help="Initial bias for necessity gate (sigmoid domain)")
 
     # ---- Training ----
     p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--max_length", type=int, default=4096)
+    p.add_argument("--gen_max_length", type=int, default=256,
+             help="Max length for MT generation during eval")
+    p.add_argument("--seed", type=int, default=42)
 
     args = p.parse_args()
     if args.tokenizer is None:
@@ -116,6 +123,8 @@ def main():
         print(f"  types      : {args.num_types}")
         print(f"  top_k      : {args.top_k}")
         print(f"  grad_ckpt  : {args.gradient_checkpoint}")
+        print(f"  alpha_init : {args.alpha_init}")
+        print(f"  gate_bias  : {args.gate_bias_init}")
         print(f"  α(collapse): {args.anti_collapse_weight}")
         print(f"  β(null_rt) : {args.null_route_weight}")
     print(f"  epochs     : {args.epochs}")
