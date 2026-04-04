@@ -134,7 +134,16 @@ def compute_comet(preds, refs, srcs, model_name="Unbabel/wmt22-comet-da"):
         path  = download_model(model_name)
         model = load_from_checkpoint(path)
         data  = [{"src": s, "mt": p, "ref": r} for s, p, r in zip(srcs, preds, refs)]
-        out   = model.predict(data, batch_size=8, gpus=0)
+        use_gpu = torch.cuda.is_available()
+        gpus = 1 if use_gpu else 0
+        try:
+            out = model.predict(data, batch_size=8, gpus=gpus)
+        except Exception as gpu_exc:
+            if use_gpu:
+                warnings.warn(f"COMET GPU scoring failed, fallback to CPU: {gpu_exc}")
+                out = model.predict(data, batch_size=8, gpus=0)
+            else:
+                raise
         return {"comet": float(out.system_score)}
     except Exception as exc:
         warnings.warn(f"COMET scoring failed: {exc}")

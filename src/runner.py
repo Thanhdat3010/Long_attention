@@ -28,7 +28,7 @@ from src.metrics import (
     compute_em_aliases, compute_f1_aliases,
     compute_faithfulness, compute_rouge, compute_routing_stats,
 )
-from src.modeling import anti_collapse_loss, null_route_loss
+from src.longattention_layer import anti_collapse_loss, null_route_loss
 from transformers import get_linear_schedule_with_warmup
 
 
@@ -57,6 +57,12 @@ def train(args: Namespace):
 
     print(f"  [1/4] Loading tokenizer: {args.tokenizer} ...")
     tokenizer = get_tokenizer(args.tokenizer, args.max_length)
+    effective_max_length = int(getattr(tokenizer, "model_max_length", args.max_length))
+    if effective_max_length < int(args.max_length):
+        print(
+            f"  [warn] max_length={args.max_length} exceeds tokenizer/backbone capacity; "
+            f"using max_length={effective_max_length}"
+        )
     print(f"  [1/4] Tokenizer ready.")
 
     # Data
@@ -64,7 +70,7 @@ def train(args: Namespace):
     test_path  = os.path.join(args.dataset_path, "test.csv")
     print(f"  [2/4] Building train dataset (tokenizing all samples) ...")
     loader = get_dataloader(args.task, train_path, tokenizer,
-                            batch_size=args.batch_size, max_length=args.max_length)
+                            batch_size=args.batch_size, max_length=effective_max_length)
     print(f"  [2/4] Train dataset ready: {len(loader.dataset)} samples, {len(loader)} batches.")
 
     # Model
@@ -112,6 +118,8 @@ def train(args: Namespace):
         model.train()
         total_loss, nb = 0.0, 0
         epoch_alphas: List[float] = []
+        ac_warn_count = 0
+        nr_warn_count = 0
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
 
         for step_idx, batch in enumerate(pbar):
@@ -141,25 +149,52 @@ def train(args: Namespace):
 
                     # Task loss
                     sl, el = out["start_logits"], out["end_logits"]
+                    sl = torch.nan_to_num(sl, nan=-1e4, posinf=1e4, neginf=-1e4)
+                    el = torch.nan_to_num(el, nan=-1e4, posinf=1e4, neginf=-1e4)
                     if context_mask is not None:
-                        mask_val = torch.finfo(sl.dtype).min
+                        # Avoid dtype min in AMP; very large magnitude can destabilize softmax/CE.
+                        mask_val = -1e4
                         sl = sl.masked_fill(context_mask == 0, mask_val)
                         el = el.masked_fill(context_mask == 0, mask_val)
                     sp = labels[:, 0]
                     ep = labels[:, 1]
                     sp = torch.where(sp >= 0, sp.clamp(max=ids.size(1) - 1), sp)
                     ep = torch.where(ep >= 0, ep.clamp(max=ids.size(1) - 1), ep)
-                    task_l = qa_loss(sl, el, sp, ep)
+                    task_l = qa_loss(sl.float(), el.float(), sp, ep)
 
                 # Regularization (LongAttention only)
                 raw_loss = task_l
                 if is_la and layer_infos:
                     ac = anti_collapse_loss(layer_infos)
                     nr = null_route_loss(layer_infos)
+                    if not torch.isfinite(ac):
+                        ac_warn_count += 1
+                        if ac_warn_count <= 5 or ac_warn_count % 100 == 0:
+                            print(
+                                f"[warn] non-finite anti_collapse at epoch={epoch} step={step_idx}; "
+                                f"set to 0 (count={ac_warn_count})"
+                            )
+                        ac = torch.zeros((), device=task_l.device, dtype=task_l.dtype)
+                    if not torch.isfinite(nr):
+                        nr_warn_count += 1
+                        if nr_warn_count <= 5 or nr_warn_count % 100 == 0:
+                            print(
+                                f"[warn] non-finite null_route at epoch={epoch} step={step_idx}; "
+                                f"set to 0 (count={nr_warn_count})"
+                            )
+                        nr = torch.zeros((), device=task_l.device, dtype=task_l.dtype)
                     raw_loss = raw_loss + args.anti_collapse_weight * ac + args.null_route_weight * nr
 
                 # Chia loss cho accum_steps vì PyTorch cộng dồn thay vì lấy trung bình
                 loss = raw_loss / accum_steps
+
+            if not torch.isfinite(loss):
+                print(
+                    f"[warn] non-finite loss at epoch={epoch} step={step_idx}: "
+                    f"raw_loss={float(raw_loss.detach().float().cpu())}"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             # ---- Backward with scaler ----
             scaler.scale(loss).backward()
@@ -228,6 +263,12 @@ def evaluate(args: Namespace):
     print(f"\n[EVAL] model={args.model}  backbone={args.backbone}  task={args.task}  device={device}")
 
     tokenizer = get_tokenizer(args.tokenizer, args.max_length)
+    effective_max_length = int(getattr(tokenizer, "model_max_length", args.max_length))
+    if effective_max_length < int(args.max_length):
+        print(
+            f"  [warn] max_length={args.max_length} exceeds tokenizer/backbone capacity; "
+            f"using max_length={effective_max_length}"
+        )
 
     model = build_model(args).to(device)
     ckpts = sorted(
@@ -249,7 +290,7 @@ def evaluate(args: Namespace):
         print(f"  WARNING: test.csv not found at {test_path}")
         return {}
     loader = get_dataloader(args.task, test_path, tokenizer,
-                            batch_size=args.batch_size, max_length=args.max_length, shuffle=False)
+                            batch_size=args.batch_size, max_length=effective_max_length, shuffle=False)
 
     preds, refs, aliases, srcs = [], [], [], []
     selected_segments, gold_segments = [], []
@@ -296,7 +337,7 @@ def evaluate(args: Namespace):
 
                 sl, el = out["start_logits"], out["end_logits"]
                 if context_mask is not None:
-                    mask_val = torch.finfo(sl.dtype).min
+                    mask_val = -1e4
                     sl = sl.masked_fill(context_mask == 0, mask_val)
                     el = el.masked_fill(context_mask == 0, mask_val)
                 si = sl.argmax(-1)
@@ -324,8 +365,15 @@ def evaluate(args: Namespace):
                         seg_hi = ge // args.segment_size
                         gold_segments.append(list(range(seg_lo, seg_hi + 1)))
 
+                        # Fix Faithfulness: check if Question tokens route to the gold answer segment
+                        if global_attn is not None:
+                            question_tokens = (global_attn[b] == 1).nonzero(as_tuple=True)[0]
+                        else:
+                            # Fallback (e.g. first 50 tokens are typically the question)
+                            question_tokens = torch.arange(min(50, ids.size(1)), device=device)
+
                         sel = set()
-                        for t in range(gs, ge + 1):
+                        for t in question_tokens:
                             segs = topk_idx[b, :, t, :].reshape(-1)
                             sel.update([int(x) for x in segs.tolist()])
                         selected_segments.append(sorted(sel))

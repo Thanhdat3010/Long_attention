@@ -58,7 +58,12 @@ def _cache_file(path: str, task: str, tokenizer, max_length: int) -> str:
 def get_tokenizer(name_or_path: str, max_length: int = 4096):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(name_or_path, use_fast=True)
-    tok.model_max_length = max_length
+    pretrained_max = getattr(tok, "model_max_length", None)
+    # Some tokenizers use a huge sentinel (e.g. 1e30) when max length is undefined.
+    if isinstance(pretrained_max, int) and pretrained_max > 0 and pretrained_max < 1_000_000:
+        tok.model_max_length = min(max_length, pretrained_max)
+    else:
+        tok.model_max_length = max_length
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return tok
@@ -128,9 +133,12 @@ class DocMTDataset(Dataset):
         cache_path = _cache_file(path, "docmt", tokenizer, max_length)
         if os.path.isfile(cache_path):
             print(f"[DocMTDataset] loading cache: {cache_path}")
-            self.samples = torch.load(cache_path, map_location="cpu")
-            print(f"[DocMTDataset] loaded cache: {cache_path} ({len(self.samples)} samples)")
-            return
+            cached = torch.load(cache_path, map_location="cpu")
+            if self._is_valid_cache(cached):
+                self.samples = cached
+                print(f"[DocMTDataset] loaded cache: {cache_path} ({len(self.samples)} samples)")
+                return
+            print(f"[DocMTDataset] invalid cache detected, rebuilding: {cache_path}")
 
         batch_size = 128
         for i in tqdm(range(0, len(self.rows), batch_size), desc=f"[DocMTDataset] Tokenizing {path}"):
@@ -146,7 +154,6 @@ class DocMTDataset(Dataset):
                 return_tensors="pt",
             )
             tgt = self.tokenizer(
-                sources,
                 text_target=targets,
                 max_length=self.max_length,
                 truncation=True,
@@ -170,6 +177,35 @@ class DocMTDataset(Dataset):
 
         torch.save(self.samples, cache_path)
         print(f"[DocMTDataset] saved cache: {cache_path}")
+
+    def _is_valid_cache(self, cached) -> bool:
+        if not isinstance(cached, list) or len(cached) == 0:
+            return False
+        sample = cached[0]
+        if not isinstance(sample, dict):
+            return False
+        required = {"input_ids", "attention_mask", "labels"}
+        if not required.issubset(sample.keys()):
+            return False
+
+        try:
+            vocab_size = int(self.tokenizer.vocab_size)
+            input_ids = sample["input_ids"]
+            labels = sample["labels"]
+            attn = sample["attention_mask"]
+
+            if not torch.is_tensor(input_ids) or not torch.is_tensor(labels) or not torch.is_tensor(attn):
+                return False
+            if int(input_ids.min().item()) < 0 or int(input_ids.max().item()) >= vocab_size:
+                return False
+            valid_labels = labels[labels >= 0]
+            if valid_labels.numel() > 0 and int(valid_labels.max().item()) >= vocab_size:
+                return False
+            if not torch.all((attn == 0) | (attn == 1)):
+                return False
+            return True
+        except Exception:
+            return False
 
     def __len__(self):
         return len(self.samples)

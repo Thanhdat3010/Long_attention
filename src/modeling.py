@@ -1,328 +1,366 @@
 """
-modeling.py — LongAttention v2 (Summary-Level Long-Range, Memory-Efficient)
-============================================================================
+modeling.py — Backbone Family Adapters for Attention-Only Replacement
+=====================================================================
 
-Architecture per layer:
-  1. Local branch:  dense sliding-window attention (chunked, O(L·W))
-  2. Long-range branch:
-     a. SegmentSummarizer: mean-pool tokens into segment summaries
-     b. NecessityRouter:   gate + top-K segment selection + type assignment
-     c. LongRangeAttention: query attends to segment SUMMARY vectors (not tokens)
-  3. Combine:  A_i = A_local + g_i · A_long
-
-Memory: ~150MB activations per layer vs ~1.6GB before (100× reduction).
-Formula unchanged from proposal:
-  A_i^long = Σ_t Σ_{s ∈ topk} w_{i,s} · m_{i,t} · Attn_t(q_i, SK_s, SV_s)
+This module contains adapter/wrapper code to replace attention modules
+inside existing Hugging Face backbones while keeping the rest intact.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
-TASK_DEPENDENCY_TYPES = {
-    "docmt": ["coreference", "lexical_consistency", "tense_aspect", "discourse_relation"],
-    "qa":    ["direct_evidence", "supporting_evidence", "bridging_evidence", "distractor_conflict"],
-}
+from src.longattention_layer import LongAttentionCore
 
 
-# ===================================================================== #
-#  Segment Summarizer                                                    #
-# ===================================================================== #
+class LongAttentionBartSelfAttentionAdapter(nn.Module):
+    """Replace BART/MBART encoder self-attention with LongAttentionCore."""
 
-class SegmentSummarizer(nn.Module):
-    def __init__(self, segment_size: int = 64):
-        super().__init__()
-        self.segment_size = segment_size
-
-    def forward(self, keys, values, attention_mask=None):
-        """(B,H,L,D) → sk(B,H,S,D), sv(B,H,S,D), num_segments, seg_mask"""
-        B, H, L, D = keys.shape
-        ss = self.segment_size
-        pad = (ss - L % ss) % ss
-        if pad > 0:
-            keys = F.pad(keys, (0, 0, 0, pad))
-            values = F.pad(values, (0, 0, 0, pad))
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(1).unsqueeze(-1)  # (B,1,L,1)
-            if pad > 0:
-                mask = F.pad(mask, (0, 0, 0, pad))
-        else:
-            mask = None
-
-        n = keys.shape[2] // ss
-        k = keys.reshape(B, H, n, ss, D)
-        v = values.reshape(B, H, n, ss, D)
-
-        if mask is None:
-            sk = k.mean(3)
-            sv = v.mean(3)
-            seg_mask = None
-        else:
-            m = mask.reshape(B, 1, n, ss, 1)
-            denom = m.sum(3).clamp(min=1.0)  # (B,1,S,1)
-            sk = (k * m).sum(3) / denom
-            sv = (v * m).sum(3) / denom
-            seg_mask = (denom.squeeze(-1).squeeze(1) > 0)
-
-        return sk, sv, n, seg_mask
-
-
-# ===================================================================== #
-#  Necessity Router (Top-K)                                              #
-# ===================================================================== #
-
-class NecessityRouter(nn.Module):
-    def __init__(self, d_head: int, num_types: int = 4):
-        super().__init__()
-        self.gate_proj = nn.Sequential(
-            nn.Linear(d_head, d_head // 2), nn.GELU(), nn.Linear(d_head // 2, 1),
-        )
-        self.type_proj = nn.Linear(d_head, num_types)
-
-    def forward(self, queries, seg_keys, num_segments, layer_ratio=0.5, top_k=4, seg_mask=None):
-        """
-        Returns:
-            gate:      (B,H,L,1)
-            topk_idx:  (B,H,L,K)
-            topk_w:    (B,H,L,K)
-            type_mask: (B,H,L,T)
-        """
-        D = queries.shape[-1]
-        gate = torch.sigmoid(self.gate_proj(queries))
-
-        # Scale first to prevent FP16 overflow in dot product
-        q_scaled = queries / math.sqrt(D)
-        seg_logits = torch.einsum("bhld,bhsd->bhls", q_scaled, seg_keys)
-        if seg_mask is not None:
-            mask_val = torch.finfo(seg_logits.dtype).min
-            seg_logits = seg_logits.masked_fill(~seg_mask.unsqueeze(1).unsqueeze(2), mask_val)
-        K = min(top_k, num_segments)
-        topk_vals, topk_idx = seg_logits.topk(K, dim=-1)
-
-        temp = max(1.0 - layer_ratio, 0.1)
-        topk_w = F.softmax(topk_vals / temp, dim=-1)
-        type_mask = F.softmax(self.type_proj(queries) / temp, dim=-1)
-
-        return gate, topk_idx, topk_w, type_mask
-
-
-# ===================================================================== #
-#  Local Attention (Chunked)                                             #
-# ===================================================================== #
-
-class LocalAttention(nn.Module):
-    def __init__(self, d_head: int, window_size: int = 256):
-        super().__init__()
-        self.W = window_size
-
-    def forward(self, q, k, v, attention_mask=None):
-        L = q.shape[2]
-        # Create a bidirectional sliding window mask: |i - j| <= W
-        idx = torch.arange(L, device=q.device)
-        attn_mask = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs() <= self.W
-        
-        if attention_mask is not None:
-            # attention_mask: (B, L) with 1 for real tokens, 0 for padding
-            pad_mask = attention_mask.unsqueeze(1).unsqueeze(2).expand(-1, -1, L, -1).bool()
-            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & pad_mask
-
-        # SDPA handles this efficiently (Math backend for boolean mask)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        if attention_mask is not None:
-            out = out * attention_mask.unsqueeze(1).unsqueeze(-1)
-        return out
-
-
-# ===================================================================== #
-#  Long-Range Attention (Summary-Level — ultra memory-efficient)         #
-# ===================================================================== #
-
-class LongRangeAttention(nn.Module):
-    """
-    A_i^long = Σ_t Σ_{s ∈ topk} w_{i,s} · m_{i,t} · Attn_t(q_i, SK_s, SV_s)
-
-    Attends to segment SUMMARY vectors (1 vector per segment) instead of
-    individual tokens within segments.
-
-    Memory per layer:  O(L · K · D)  — with K=4, D=64: ~3MB
-    vs token-level:    O(L · K · Ss · D) — with Ss=64:  ~200MB
-    """
-
-    def __init__(self, d_head: int, num_types: int = 4):
-        super().__init__()
-        self.num_types = num_types
-        self.scale = 1.0 / math.sqrt(d_head)
-        self.type_query_projs = nn.ModuleList(
-            [nn.Linear(d_head, d_head, bias=False) for _ in range(num_types)]
-        )
-
-    def forward(self, q, sk, sv, topk_idx, topk_w, type_mask):
-        """
-        q:         (B,H,L,D)   — queries
-        sk:        (B,H,S,D)   — segment summary keys
-        sv:        (B,H,S,D)   — segment summary values
-        topk_idx:  (B,H,L,K)   — selected segment indices
-        topk_w:    (B,H,L,K)   — selection weights
-        type_mask: (B,H,L,T)   — dependency-type distribution
-        """
-        B, H, L, D = q.shape
-        K = topk_idx.shape[-1]
-
-        # Gather top-K summary vectors — (B,H,L,K,D) — TINY tensor
-        idx_k = topk_idx.unsqueeze(-1).expand(B, H, L, K, D)    # (B,H,L,K,D)
-        sk_sel = sk.unsqueeze(2).expand(B, H, L, -1, D)         # (B,H,L,S,D)
-        sk_sel = sk_sel.gather(3, idx_k)                          # (B,H,L,K,D)
-        sv_sel = sv.unsqueeze(2).expand(B, H, L, -1, D)
-        sv_sel = sv_sel.gather(3, idx_k)                          # (B,H,L,K,D)
-
-        out = torch.zeros(B, H, L, D, device=q.device, dtype=q.dtype)
-
-        for t in range(self.num_types):
-            qt = self.type_query_projs[t](q)                      # (B,H,L,D)
-            t_w = type_mask[..., t].unsqueeze(-1)                 # (B,H,L,1)
-
-            # Attention: query vs K summary vectors
-            # Scale first to prevent fp16 overflow
-            qt_scaled = qt * self.scale
-            attn = torch.einsum("bhld,bhlkd->bhlk", qt_scaled, sk_sel)  # (B,H,L,K)
-            attn = F.softmax(attn, dim=-1)                        # (B,H,L,K)
-
-            # Combine with segment weights
-            attn = attn * topk_w                                  # (B,H,L,K)
-            attn = attn / (attn.sum(-1, keepdim=True) + 1e-8)    # re-normalize
-
-            # Weighted sum of summary values
-            val = torch.einsum("bhlk,bhlkd->bhld", attn, sv_sel) # (B,H,L,D)
-
-            out = out + t_w * val
-
-        return out
-
-
-# ===================================================================== #
-#  LongAttention v2 Layer                                                #
-# ===================================================================== #
-
-class LongAttentionLayer(nn.Module):
     def __init__(
         self,
-        d_model: int,
-        num_heads: int,
-        num_types: int = 4,
-        window_size: int = 256,
-        segment_size: int = 64,
-        top_k: int = 4,
-        ff_mult: int = 4,
-        dropout: float = 0.1,
-        alpha_init: float = 0.02,
-        gate_bias_init: float = 0.0,
+        original_attn: nn.Module,
+        core: LongAttentionCore,
+        *,
+        layer_index: int,
+        total_layers: int,
     ):
         super().__init__()
-        assert d_model % num_heads == 0
-        self.num_heads = num_heads
-        self.d_head = d_model // num_heads
-        self.top_k = top_k
-        self.use_checkpoint = False
+        self.original_attn = original_attn
+        self.embed_dim = original_attn.embed_dim
+        self.num_heads = original_attn.num_heads
+        self.head_dim = original_attn.head_dim
+        self.scaling = original_attn.scaling
+        self.dropout = getattr(original_attn, "dropout", 0.0)
+        self.is_decoder = getattr(original_attn, "is_decoder", False)
 
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        # Reuse original projection layers for fair comparison.
+        self.q_proj = original_attn.q_proj
+        self.k_proj = original_attn.k_proj
+        self.v_proj = original_attn.v_proj
+        self.out_proj = original_attn.out_proj
 
-        self.seg_summarizer = SegmentSummarizer(segment_size)
-        self.router = NecessityRouter(self.d_head, num_types)
-        self.local_attn = LocalAttention(self.d_head, window_size)
-        self.long_attn = LongRangeAttention(self.d_head, num_types)
+        self.core = core
+        self.layer_index = layer_index
+        self.total_layers = max(total_layers, 1)
+        self.last_info: Optional[Dict[str, torch.Tensor]] = None
 
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_model * ff_mult), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_model * ff_mult, d_model), nn.Dropout(dropout),
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int) -> torch.Tensor:
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+        **kwargs,
+    ):
+        # Keep unsupported paths unchanged to preserve compatibility.
+        if key_value_states is not None or past_key_value is not None:
+            return self.original_attn(
+                hidden_states,
+                key_value_states=key_value_states,
+                past_key_value=past_key_value,
+                attention_mask=attention_mask,
+                layer_head_mask=layer_head_mask,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
+
+        bsz, tgt_len, _ = hidden_states.size()
+        q = self._shape(self.q_proj(hidden_states) * self.scaling, tgt_len, bsz)
+        k = self._shape(self.k_proj(hidden_states), tgt_len, bsz)
+        v = self._shape(self.v_proj(hidden_states), tgt_len, bsz)
+
+        ratio = self.layer_index / max(self.total_layers - 1, 1)
+        attn_output, info = self.core(q, k, v, attention_mask=attention_mask, layer_ratio=ratio)
+        self.last_info = info
+
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+
+        attn_weights_reshaped = None
+        if output_attentions:
+            # Keep interface without materializing dense LxL matrix.
+            attn_weights_reshaped = info["topk_w"].mean(dim=1)
+
+        return attn_output, attn_weights_reshaped, None
+
+
+class LongAttentionQASelfAttentionAdapter(nn.Module):
+    """Replace BERT-like encoder self-attention with LongAttentionCore."""
+
+    def __init__(
+        self,
+        original_self_attn: nn.Module,
+        core: LongAttentionCore,
+        *,
+        layer_index: int,
+        total_layers: int,
+    ):
+        super().__init__()
+        self.original = original_self_attn
+
+        self.query = original_self_attn.query
+        self.key = original_self_attn.key
+        self.value = original_self_attn.value
+
+        # Common HF pattern for BERT-like modules.
+        self.num_attention_heads = getattr(original_self_attn, "num_attention_heads")
+        self.attention_head_size = getattr(original_self_attn, "attention_head_size")
+        self.all_head_size = getattr(original_self_attn, "all_head_size")
+
+        self.core = core
+        self.layer_index = layer_index
+        self.total_layers = max(total_layers, 1)
+        self.last_info: Optional[Dict[str, torch.Tensor]] = None
+
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        output_attentions: bool = False,
+        **kwargs,
+    ):
+        # Fallback for cross-attn or cached decoding if present.
+        if encoder_hidden_states is not None or past_key_value is not None:
+            return self.original(
+                hidden_states,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
+
+        q = self.transpose_for_scores(self.query(hidden_states))
+        k = self.transpose_for_scores(self.key(hidden_states))
+        v = self.transpose_for_scores(self.value(hidden_states))
+
+        ratio = self.layer_index / max(self.total_layers - 1, 1)
+        context, info = self.core(q, k, v, attention_mask=attention_mask, layer_ratio=ratio)
+        self.last_info = info
+
+        context = context.permute(0, 2, 1, 3).contiguous()
+        new_context_shape = context.size()[:-2] + (self.all_head_size,)
+        context = context.view(new_context_shape)
+
+        if output_attentions:
+            attn_probs = info["topk_w"].mean(dim=1)
+            return (context, attn_probs)
+        return (context,)
+
+
+class LongAttentionLongformerSelfAttentionAdapter(nn.Module):
+    """Replace Longformer self-attention while keeping Longformer layer interface."""
+
+    def __init__(
+        self,
+        original_self_attn: nn.Module,
+        core: LongAttentionCore,
+        *,
+        layer_index: int,
+        total_layers: int,
+    ):
+        super().__init__()
+        self.original = original_self_attn
+        self.query = original_self_attn.query
+        self.key = original_self_attn.key
+        self.value = original_self_attn.value
+
+        self.num_heads = getattr(original_self_attn, "num_heads")
+        self.head_dim = getattr(original_self_attn, "head_dim")
+        self.embed_dim = getattr(original_self_attn, "embed_dim", self.num_heads * self.head_dim)
+
+        self.core = core
+        self.layer_index = layer_index
+        self.total_layers = max(total_layers, 1)
+        self.last_info: Optional[Dict[str, torch.Tensor]] = None
+
+    def _shape(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, _ = x.shape
+        return x.view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        is_index_masked: Optional[torch.Tensor] = None,
+        is_index_global_attn: Optional[torch.Tensor] = None,
+        is_global_attn: Optional[bool] = None,
+        output_attentions: bool = False,
+    ):
+        q = self._shape(self.query(hidden_states))
+        k = self._shape(self.key(hidden_states))
+        v = self._shape(self.value(hidden_states))
+
+        ratio = self.layer_index / max(self.total_layers - 1, 1)
+        context, info = self.core(q, k, v, attention_mask=attention_mask, layer_ratio=ratio)
+        self.last_info = info
+
+        context = context.permute(0, 2, 1, 3).contiguous().view(hidden_states.size(0), hidden_states.size(1), self.embed_dim)
+
+        if output_attentions:
+            attn_probs = info["topk_w"].mean(dim=1)
+            return (context, attn_probs)
+        return (context,)
+
+
+def replace_bart_encoder_attention_with_longattention(
+    model: nn.Module,
+    *,
+    num_types: int,
+    window_size: int,
+    segment_size: int,
+    top_k: int,
+    alpha_init: float,
+    gate_bias_init: float,
+) -> int:
+    if not hasattr(model, "model") or not hasattr(model.model, "encoder"):
+        raise ValueError("Expected a Seq2Seq model with model.encoder.")
+
+    layers = getattr(model.model.encoder, "layers", None)
+    if layers is None:
+        raise ValueError("Unsupported encoder structure: expected encoder.layers")
+
+    replaced = 0
+    total_layers = len(layers)
+    for idx, layer in enumerate(layers):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+
+        core = LongAttentionCore(
+            d_head=attn.head_dim,
+            num_types=num_types,
+            window_size=window_size,
+            segment_size=segment_size,
+            top_k=top_k,
+            alpha_init=alpha_init,
+            gate_bias_init=gate_bias_init,
         )
-        # ReZero-style scaling for long-range branch (learnable, starts small for stability)
-        self.alpha_long = nn.Parameter(torch.tensor(float(alpha_init)))
-        nn.init.constant_(self.router.gate_proj[-1].bias, float(gate_bias_init))
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout_layer = nn.Dropout(dropout)
-
-    def _forward_impl(self, hidden_states, layer_ratio, attention_mask=None):
-        B, L, D = hidden_states.shape
-        H, Dh = self.num_heads, self.d_head
-
-        # 1. Post-LN: QKV projections take raw hidden states
-        qkv = self.qkv_proj(hidden_states).reshape(B, L, 3, H, Dh).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        # 2. Local branch
-        a_local = self.local_attn(q, k, v, attention_mask=attention_mask)
-
-        # 3. Long-range branch (summary-level)
-        sk, sv, ns, seg_mask = self.seg_summarizer(k, v, attention_mask=attention_mask)
-        gate, topk_idx, topk_w, type_mask = self.router(
-            q, sk, ns, layer_ratio, self.top_k, seg_mask=seg_mask
+        layer.self_attn = LongAttentionBartSelfAttentionAdapter(
+            attn,
+            core,
+            layer_index=idx,
+            total_layers=total_layers,
         )
-        a_long = self.long_attn(q, sk, sv, topk_idx, topk_w, type_mask)
+        replaced += 1
+    return replaced
 
-        # 4. Combine & Post-LN 1 (Attention residual)
-        combined = a_local + self.alpha_long * gate * a_long
-        combined = combined.transpose(1, 2).reshape(B, L, D)
-        attn_out = self.norm1(hidden_states + self.dropout_layer(self.out_proj(combined)))
 
-        # 5. FFN & Post-LN 2 (FFN residual)
-        x = self.norm2(attn_out + self.ff(attn_out))
+def replace_qa_encoder_attention_with_longattention(
+    encoder: nn.Module,
+    *,
+    num_types: int,
+    window_size: int,
+    segment_size: int,
+    top_k: int,
+    alpha_init: float,
+    gate_bias_init: float,
+) -> int:
+    if hasattr(encoder, "encoder") and hasattr(encoder.encoder, "layer"):
+        layers = encoder.encoder.layer
+    elif hasattr(encoder, "layer"):
+        layers = encoder.layer
+    else:
+        raise ValueError("Unsupported QA encoder structure: expected encoder.layer")
 
-        return x, gate, topk_idx, topk_w, type_mask
+    replaced = 0
+    total_layers = len(layers)
+    for idx, layer in enumerate(layers):
+        attn_container = getattr(layer, "attention", None)
+        if attn_container is None or not hasattr(attn_container, "self"):
+            continue
 
-    def forward(self, hidden_states, layer_ratio=0.5, attention_mask=None):
-        if self.use_checkpoint and self.training:
-            lr_t = torch.tensor(layer_ratio, device=hidden_states.device)
-            x, gate, topk_idx, topk_w, type_mask = checkpoint(
-                self._forward_ckpt, hidden_states, lr_t, attention_mask, use_reentrant=False
+        original_self = attn_container.self
+        cls_name = original_self.__class__.__name__.lower()
+        if "longformer" in cls_name:
+            heads = getattr(original_self, "num_heads", None)
+            head_dim = getattr(original_self, "head_dim", None)
+        else:
+            heads = getattr(original_self, "num_attention_heads", None)
+            head_dim = getattr(original_self, "attention_head_size", None)
+        if heads is None or head_dim is None:
+            continue
+
+        core = LongAttentionCore(
+            d_head=head_dim,
+            num_types=num_types,
+            window_size=window_size,
+            segment_size=segment_size,
+            top_k=top_k,
+            alpha_init=alpha_init,
+            gate_bias_init=gate_bias_init,
+        )
+        if "longformer" in cls_name:
+            attn_container.self = LongAttentionLongformerSelfAttentionAdapter(
+                original_self,
+                core,
+                layer_index=idx,
+                total_layers=total_layers,
             )
         else:
-            x, gate, topk_idx, topk_w, type_mask = self._forward_impl(hidden_states, layer_ratio, attention_mask)
+            attn_container.self = LongAttentionQASelfAttentionAdapter(
+                original_self,
+                core,
+                layer_index=idx,
+                total_layers=total_layers,
+            )
+        replaced += 1
 
-        info = {
-            "gate": gate,
-            "topk_idx": topk_idx,
-            "topk_w": topk_w,
-            "type_mask": type_mask,
-            "alpha": self.alpha_long,
-        }
-        return x, info
-
-    def _forward_ckpt(self, hidden_states, lr_tensor, attention_mask):
-        return self._forward_impl(hidden_states, lr_tensor.item(), attention_mask)
+    if replaced == 0:
+        raise ValueError("No QA self-attention module was replaced; unsupported backbone family.")
+    return replaced
 
 
-# ===================================================================== #
-#  Regularization Losses                                                 #
-# ===================================================================== #
-
-def anti_collapse_loss(layer_infos):
-    total_loss = torch.tensor(0.0, device=layer_infos[0]["type_mask"].device)
-    for info in layer_infos:
-        tm = info["type_mask"] # (B, H, L, T)
-        
-        # 1. Maximize marginal entropy: encourage using all types globally
-        marginal_p = tm.mean(dim=(0, 1, 2))  # (T,)
-        h_marginal = -(marginal_p * (marginal_p + 1e-8).log()).sum()
-        
-        # 2. Minimize per-token entropy: encourage each token to pick one type
-        h_token = -(tm * (tm + 1e-8).log()).sum(dim=-1).mean()
-        
-        # Final loss: h_token - h_marginal (minimize this to achieve both goals)
-        total_loss = total_loss + (h_token - h_marginal)
-        
-    return total_loss / len(layer_infos)
+def collect_replaced_seq2seq_layer_infos(model: nn.Module) -> List[Dict[str, torch.Tensor]]:
+    infos: List[Dict[str, torch.Tensor]] = []
+    if not hasattr(model, "model") or not hasattr(model.model, "encoder"):
+        return infos
+    layers = getattr(model.model.encoder, "layers", None)
+    if layers is None:
+        return infos
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        info = getattr(attn, "last_info", None)
+        if info is not None:
+            infos.append(info)
+    return infos
 
 
-def null_route_loss(layer_infos):
-    total = torch.tensor(0.0, device=layer_infos[0]["gate"].device)
-    for info in layer_infos:
-        total = total + info["gate"].mean()
-    return total / len(layer_infos)
+def collect_replaced_qa_layer_infos(encoder: nn.Module) -> List[Dict[str, torch.Tensor]]:
+    infos: List[Dict[str, torch.Tensor]] = []
+    if hasattr(encoder, "encoder") and hasattr(encoder.encoder, "layer"):
+        layers = encoder.encoder.layer
+    elif hasattr(encoder, "layer"):
+        layers = encoder.layer
+    else:
+        return infos
+
+    for layer in layers:
+        attn_container = getattr(layer, "attention", None)
+        if attn_container is None:
+            continue
+        attn = getattr(attn_container, "self", None)
+        info = getattr(attn, "last_info", None)
+        if info is not None:
+            infos.append(info)
+    return infos

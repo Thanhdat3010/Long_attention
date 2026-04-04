@@ -83,11 +83,11 @@ def main():
     p.add_argument("--null_route_weight", type=float, default=0.01)
 
     # ---- LongAttention v2 config ----
-    p.add_argument("--window_size", type=int, default=256)
+    p.add_argument("--window_size", type=int, default=512)
     p.add_argument("--segment_size", type=int, default=64)
     p.add_argument("--num_types", type=int, default=4)
-    p.add_argument("--top_k", type=int, default=4,
-                   help="Top-K segments to route to (lower=less memory, default 4)")
+    p.add_argument("--top_k", type=int, default=2,
+             help="Top-K segments to route to (lower=less memory, default 2)")
     p.add_argument("--gradient_checkpoint", action="store_true",
                    help="Enable gradient checkpointing (saves ~2-3× memory, slower)")
     p.add_argument("--alpha_init", type=float, default=0.02,
@@ -99,7 +99,7 @@ def main():
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--max_length", type=int, default=4096)
+    p.add_argument("--max_length", type=int, default=2048)
     p.add_argument("--gen_max_length", type=int, default=256,
              help="Max length for MT generation during eval")
     p.add_argument("--seed", type=int, default=42)
