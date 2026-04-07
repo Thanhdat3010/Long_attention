@@ -224,14 +224,18 @@ def compute_routing_stats(layer_infos):
     """
     gates, types, entropies = [], [], []
     for info in layer_infos:
-        g  = info["gate"]
-        tm = info["type_mask"]
+        g = torch.nan_to_num(info["gate"].float(), nan=0.0, posinf=1.0, neginf=0.0)
+        tm = torch.nan_to_num(info["type_mask"].float(), nan=0.0, posinf=1.0, neginf=0.0)
+        tm = tm / tm.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         gates.append(float(g.mean()))
         types.append(tm.mean(dim=(0, 1, 2)).tolist())
         if "topk_w" in info:
-            tw = info["topk_w"]
+            tw = torch.nan_to_num(info["topk_w"].float(), nan=0.0, posinf=1.0, neginf=0.0)
+            tw = tw / tw.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            tw = tw.clamp_min(1e-6)
+            tw = tw / tw.sum(dim=-1, keepdim=True).clamp_min(1e-6)
             entropies.append(
-                float(-(tw * (tw + 1e-8).log()).sum(-1).mean())
+                float(-(tw * tw.log()).sum(-1).mean())
             )
         else:
             entropies.append(0.0)

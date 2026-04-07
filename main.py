@@ -81,6 +81,18 @@ def main():
     # ---- Regularization (LongAttention v2 only) ----
     p.add_argument("--anti_collapse_weight", type=float, default=0.01)
     p.add_argument("--null_route_weight", type=float, default=0.01)
+    p.add_argument("--route_budget_weight", type=float, default=1.1e-3,
+             help="Penalty for over-open long-range routing (depth-aware)")
+    p.add_argument("--route_consistency_weight", type=float, default=1e-4,
+             help="Penalty for abrupt top-k distribution shifts across adjacent layers")
+    p.add_argument("--route_budget_warmup_ratio", type=float, default=0.35,
+         help="Fraction of training used to ramp route budget penalty from 0 to full weight")
+    p.add_argument("--routing_reg_warmup_ratio", type=float, default=0.35,
+         help="Fraction of training used to ramp routing regularizers (entropy/margin/consistency)")
+    p.add_argument("--faithfulness_conf_ratio", type=float, default=0.5,
+         help="Eval-only confidence ratio for selecting routed segments")
+    p.add_argument("--faithfulness_vote_ratio", type=float, default=0.025,
+         help="Eval-only minimum vote ratio for routed segment acceptance")
 
     # ---- LongAttention v2 config ----
     p.add_argument("--window_size", type=int, default=512)
@@ -127,6 +139,12 @@ def main():
         print(f"  gate_bias  : {args.gate_bias_init}")
         print(f"  α(collapse): {args.anti_collapse_weight}")
         print(f"  β(null_rt) : {args.null_route_weight}")
+        print(f"  λ(budget)  : {args.route_budget_weight}")
+        print(f"  λ(consist) : {args.route_consistency_weight}")
+        print(f"  warmup(bgt): {args.route_budget_warmup_ratio}")
+        print(f"  warmup(reg): {args.routing_reg_warmup_ratio}")
+        print(f"  eval conf  : {args.faithfulness_conf_ratio}")
+        print(f"  eval votes : {args.faithfulness_vote_ratio}")
     print(f"  epochs     : {args.epochs}")
     print(f"  batch_size : {args.batch_size}")
     print(f"  lr         : {args.lr}")

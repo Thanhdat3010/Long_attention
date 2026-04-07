@@ -76,23 +76,86 @@ class NecessityRouter(nn.Module):
         )
         self.type_proj = nn.Linear(d_head, num_types)
 
-    def forward(self, queries, seg_keys, num_segments, layer_ratio=0.5, top_k=4, seg_mask=None):
+    def forward(self, queries, seg_keys, num_segments, layer_ratio=0.5, top_k=4, coarse_candidates=4, seg_mask=None):
         layer_ratio = float(layer_ratio)
         D = queries.shape[-1]
         qn = self.q_norm(queries.float()).to(dtype=queries.dtype)
 
+        # Task-agnostic intent anchor from current token state and global segment context.
+        q_anchor = qn.float().mean(dim=2, keepdim=True)
+        s_anchor = seg_keys.float().mean(dim=2, keepdim=True)
+        intent_anchor = torch.tanh(q_anchor + s_anchor)
+        q_norm = F.normalize(qn.float(), dim=-1, eps=1e-6)
+        intent_norm = F.normalize(intent_anchor, dim=-1, eps=1e-6)
+        token_intent_align = (q_norm * intent_norm).sum(dim=-1, keepdim=True).clamp(min=-1.0, max=1.0)
+
         gate_logits = self.gate_proj(qn).float().clamp(min=-8.0, max=8.0)
+        # Keep intent conditioning mild to avoid over-opening gate (observed in v12).
+        centered_align = token_intent_align - token_intent_align.mean(dim=2, keepdim=True)
+        gate_align_scale = 0.25 + 0.35 * layer_ratio
+        gate_logits = gate_logits + (gate_align_scale * centered_align).clamp(min=-0.8, max=0.8)
         gate = torch.sigmoid(gate_logits)
 
         q_scaled = qn.float() / math.sqrt(D)
-        seg_logits = torch.einsum("bhld,bhsd->bhls", q_scaled, seg_keys)
+        # Use a lightweight anchor-segment relevance to avoid large normalization overhead.
+        anchor_to_seg = torch.einsum(
+            "bhid,bhsd->bhis",
+            intent_anchor.float() / math.sqrt(D),
+            seg_keys.float(),
+        ).squeeze(2)
+        anchor_bias_scale = 0.08 + 0.14 * layer_ratio
+
+        # Segment pre-pruning: shrink candidate segment set before token-level routing.
+        # This substantially reduces LxS router compute/memory on long contexts.
+        # Keep more segments in shallow layers for evidence recall, tighten in deeper layers for efficiency.
+        base_keep = max(max(coarse_candidates, top_k) * 2, 12)
+        depth_bonus = int(round((1.0 - layer_ratio) * 6.0))
+        S_keep = min(num_segments, base_keep + depth_bonus)
+        if num_segments > S_keep + 2:
+            seg_scores = anchor_to_seg
+            if seg_mask is not None:
+                seg_scores = seg_scores.masked_fill(~seg_mask.unsqueeze(1), -10000.0)
+            _, seg_keep_idx = seg_scores.topk(S_keep, dim=-1)
+            gather_idx = seg_keep_idx.unsqueeze(-1).expand(-1, -1, -1, D)
+            seg_keys_eff = torch.gather(seg_keys, 2, gather_idx)
+            anchor_eff = torch.gather(anchor_to_seg, 2, seg_keep_idx)
+            coarse_logits = torch.einsum("bhld,bhsd->bhls", q_scaled, seg_keys_eff)
+            idx_map = seg_keep_idx
+        else:
+            coarse_logits = torch.einsum("bhld,bhsd->bhls", q_scaled, seg_keys)
+            anchor_eff = anchor_to_seg
+            idx_map = None
+
         if seg_mask is not None:
             # Use a safe large negative number instead of float min to prevent -inf after division
             mask_val = -10000.0
-            seg_logits = seg_logits.masked_fill(~seg_mask.unsqueeze(1).unsqueeze(2), mask_val)
+            if idx_map is not None:
+                seg_mask_eff = torch.gather(seg_mask, 1, idx_map[:, 0, :])
+                coarse_logits = coarse_logits.masked_fill(~seg_mask_eff.unsqueeze(1).unsqueeze(2), mask_val)
+            else:
+                coarse_logits = coarse_logits.masked_fill(~seg_mask.unsqueeze(1).unsqueeze(2), mask_val)
 
-        K = min(top_k, num_segments)
-        topk_vals, topk_idx = seg_logits.topk(K, dim=-1)
+        M = min(max(coarse_candidates, top_k), coarse_logits.size(-1))
+        K = min(top_k, M)
+
+        # Fast path: with few segments, skip coarse stage to reduce overhead.
+        if coarse_logits.size(-1) <= M + 2:
+            fine_logits = coarse_logits + anchor_bias_scale * anchor_eff.unsqueeze(2)
+            topk_vals, topk_idx = fine_logits.topk(K, dim=-1)
+        else:
+            # Stage-1 (coarse): keep only a small candidate set per token/head.
+            coarse_vals, coarse_idx = coarse_logits.topk(M, dim=-1)
+
+            # Stage-2 (fine): refine within coarse candidates with intent-conditioned bias.
+            coarse_anchor = torch.take_along_dim(anchor_eff.unsqueeze(2), coarse_idx, dim=-1)
+            fine_logits = coarse_vals + anchor_bias_scale * coarse_anchor
+
+            fine_vals, fine_pos = fine_logits.topk(K, dim=-1)
+            topk_idx = coarse_idx.gather(-1, fine_pos)
+            topk_vals = fine_vals
+
+        if idx_map is not None:
+            topk_idx = torch.gather(idx_map.unsqueeze(2).expand(-1, -1, topk_idx.size(2), -1), 3, topk_idx)
 
         # Sharpen routing progressively with depth, while keeping safe floors.
         seg_temp = max(0.90 - 0.45 * layer_ratio, 0.45)
@@ -115,7 +178,14 @@ class NecessityRouter(nn.Module):
         topk_w = topk_w_f.to(queries.dtype)
         type_mask = type_mask_f.to(queries.dtype)
 
-        return gate, topk_idx, topk_w, type_mask
+        aux = {
+            "token_intent_align": token_intent_align.mean().detach().to(dtype=queries.dtype),
+            "gate_align_scale": torch.tensor(float(gate_align_scale), device=queries.device, dtype=queries.dtype),
+            "anchor_bias_scale": torch.tensor(float(anchor_bias_scale), device=queries.device, dtype=queries.dtype),
+            "coarse_candidates": torch.tensor(float(M), device=queries.device, dtype=queries.dtype),
+            "prepruned_segments": torch.tensor(float(coarse_logits.size(-1)), device=queries.device, dtype=queries.dtype),
+        }
+        return gate, topk_idx, topk_w, type_mask, aux
 
 
 class LocalAttention(nn.Module):
@@ -223,6 +293,8 @@ class LongAttentionCore(nn.Module):
         window_size: int = 256,
         segment_size: int = 64,
         top_k: int = 4,
+        coarse_candidates: int = 4,
+        hard_budget: int = 1,
         alpha_init: float = 0.02,
         gate_bias_init: float = 0.0,
     ):
@@ -232,8 +304,41 @@ class LongAttentionCore(nn.Module):
         self.local_attn = LocalAttention(d_head, window_size)
         self.long_attn = LongRangeAttention(d_head, num_types)
         self.top_k = top_k
+        self.coarse_candidates = max(int(coarse_candidates), int(top_k))
+        self.hard_budget = max(1, int(hard_budget))
         self.alpha_long = nn.Parameter(torch.tensor(float(alpha_init)))
         nn.init.constant_(self.router.gate_proj[-1].bias, float(gate_bias_init))
+
+    def _effective_top_k(self, layer_ratio: float) -> int:
+        # Keep broader exploration in shallow layers, then tighten in deeper layers.
+        if self.top_k <= 2:
+            return self.top_k
+        min_k = max(2, self.top_k - 1)
+        ratio = float(max(0.0, min(1.0, layer_ratio)))
+        k_float = self.top_k - (self.top_k - min_k) * ratio
+        return int(max(min_k, min(self.top_k, round(k_float))))
+
+    @staticmethod
+    def _adaptive_margin_threshold(layer_ratio: float) -> float:
+        # Deeper layers use stricter confidence to collapse uncertain routes.
+        ratio = float(max(0.0, min(1.0, layer_ratio)))
+        return 0.16 + 0.12 * ratio
+
+    @staticmethod
+    def _gate_threshold(layer_ratio: float) -> float:
+        ratio = float(max(0.0, min(1.0, layer_ratio)))
+        return 0.46 + 0.10 * ratio
+
+    def _effective_hard_budget(self, layer_ratio: float, k_now: int) -> int:
+        if k_now <= 1:
+            return 1
+        ratio = float(max(0.0, min(1.0, layer_ratio)))
+        # Coarse-to-fine hard budget: shallower layers allow +1 route, deeper layers use minimum budget.
+        min_budget = min(k_now, self.hard_budget)
+        max_budget = min(k_now, self.hard_budget + 1)
+        budget_float = max_budget - ratio * (max_budget - min_budget)
+        budget = int(max(min_budget, min(max_budget, round(budget_float))))
+        return max(1, budget)
 
     @staticmethod
     def to_token_mask(attention_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -264,12 +369,67 @@ class LongAttentionCore(nn.Module):
         layer_ratio: float = 0.5,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         token_mask = self.to_token_mask(attention_mask)
+        layer_ratio = float(max(0.0, min(1.0, layer_ratio)))
+        eff_top_k = self._effective_top_k(layer_ratio)
+        gate_th = self._gate_threshold(layer_ratio)
+        margin_th = self._adaptive_margin_threshold(layer_ratio)
 
         a_local = self.local_attn(q, k, v, attention_mask=token_mask)
         sk, sv, ns, seg_mask = self.seg_summarizer(k, v, attention_mask=token_mask)
-        gate, topk_idx, topk_w, type_mask = self.router(
-            q, sk, ns, layer_ratio=layer_ratio, top_k=self.top_k, seg_mask=seg_mask
+        gate, topk_idx, topk_w, type_mask, aux = self.router(
+            q,
+            sk,
+            ns,
+            layer_ratio=layer_ratio,
+            top_k=eff_top_k,
+            coarse_candidates=self.coarse_candidates,
+            seg_mask=seg_mask,
         )
+
+        # Adaptive per-token route budget: keep only the strongest route when top-1 is confident.
+        if topk_w.size(-1) > 1:
+            topk_w_f = topk_w.float()
+            margin = topk_w_f[..., 0] - topk_w_f[..., 1]
+            topk_ent = -(topk_w_f.clamp_min(1e-6) * topk_w_f.clamp_min(1e-6).log()).sum(dim=-1)
+            ent_th = 0.62 - 0.22 * layer_ratio
+            low_gate_th = 0.38 + 0.09 * layer_ratio
+            prefer_single = (margin >= margin_th) | (topk_ent <= ent_th) | (gate.squeeze(-1).float() <= low_gate_th)
+            keep_mask = torch.ones_like(topk_w_f)
+            keep_mask[..., 1:] = (~prefer_single).unsqueeze(-1).to(topk_w_f.dtype)
+            topk_w_f = topk_w_f * keep_mask
+            topk_w_f = topk_w_f / topk_w_f.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            topk_w = topk_w_f.to(topk_w.dtype)
+            adaptive_single_ratio = prefer_single.float().mean()
+        else:
+            adaptive_single_ratio = torch.tensor(1.0, device=q.device, dtype=q.dtype)
+
+        # Hard route budget (stage-2): uncertainty-adaptive budget to avoid deep-layer route collapse.
+        budget_eff = self._effective_hard_budget(layer_ratio, topk_w.size(-1))
+        if topk_w.size(-1) > 1:
+            topk_w_f = topk_w.float()
+            topk_ent = -(topk_w_f.clamp_min(1e-6) * topk_w_f.clamp_min(1e-6).log()).sum(dim=-1)
+            uncertain_th = 0.52 - 0.10 * layer_ratio
+            uncertain = topk_ent > uncertain_th
+            budget_mask = torch.zeros_like(topk_w_f)
+            budget_mask[..., 0] = 1.0
+            if topk_w.size(-1) > 1:
+                allow_second = uncertain | (budget_eff > 1)
+                budget_mask[..., 1] = allow_second.to(dtype=topk_w_f.dtype)
+            topk_w_f = topk_w_f * budget_mask
+            topk_w_f = topk_w_f / topk_w_f.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+            # Entropy floor on deeper layers to avoid near one-hot collapse across all tokens.
+            if layer_ratio >= 0.55:
+                cur_ent = -(topk_w_f.clamp_min(1e-6) * topk_w_f.clamp_min(1e-6).log()).sum(dim=-1, keepdim=True)
+                ent_floor = 0.08
+                mix = ((ent_floor - cur_ent).clamp_min(0.0) / ent_floor).clamp(max=0.20)
+                uniform = torch.full_like(topk_w_f, 1.0 / topk_w_f.size(-1))
+                topk_w_f = (1.0 - mix) * topk_w_f + mix * uniform
+                topk_w_f = topk_w_f / topk_w_f.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+            topk_w = topk_w_f.to(topk_w.dtype)
+            budget_eff = float((budget_mask.sum(dim=-1).float().mean().item()))
+
         a_long = self.long_attn(q, sk, sv, topk_idx, topk_w, type_mask)
 
         if token_mask is not None:
@@ -277,13 +437,27 @@ class LongAttentionCore(nn.Module):
 
         # Bound long-range branch scale to avoid exploding residual magnitude.
         alpha = torch.tanh(self.alpha_long)
-        out = a_local + alpha * gate * a_long
+        # Smooth thresholding keeps gradients while enforcing deeper-layer selectivity.
+        gate_active = torch.sigmoid((gate - gate_th) * 6.0)
+        gate_eff = gate * gate_active
+        out = a_local + alpha * gate_eff * a_long
         info = {
             "gate": gate,
+            "gate_eff": gate_eff,
             "topk_idx": topk_idx,
             "topk_w": topk_w,
             "type_mask": type_mask,
             "alpha": alpha,
+            "effective_top_k": torch.tensor(float(eff_top_k), device=q.device, dtype=q.dtype),
+            "gate_threshold": torch.tensor(float(gate_th), device=q.device, dtype=q.dtype),
+            "adaptive_margin_threshold": torch.tensor(float(margin_th), device=q.device, dtype=q.dtype),
+            "adaptive_single_ratio": adaptive_single_ratio.to(dtype=q.dtype),
+            "gate_intent_alignment": aux["token_intent_align"],
+            "gate_align_scale": aux["gate_align_scale"],
+            "anchor_bias_scale": aux["anchor_bias_scale"],
+            "coarse_candidates": aux["coarse_candidates"],
+            "prepruned_segments": aux["prepruned_segments"],
+            "hard_budget": torch.tensor(float(budget_eff), device=q.device, dtype=q.dtype),
         }
         return out, info
 
@@ -346,23 +520,38 @@ class LongAttentionLayer(nn.Module):
         attn_out = self.norm1(hidden_states + self.dropout_layer(self.out_proj(combined)))
         x = self.norm2(attn_out + self.ff(attn_out))
 
-        return x, info["gate"], info["topk_idx"], info["topk_w"], info["type_mask"], info["alpha"]
+        return (
+            x,
+            info["gate"],
+            info.get("gate_eff", info["gate"]),
+            info["topk_idx"],
+            info["topk_w"],
+            info["type_mask"],
+            info["alpha"],
+            info.get("effective_top_k"),
+            info.get("gate_threshold"),
+        )
 
     def forward(self, hidden_states, layer_ratio=0.5, attention_mask=None):
         if self.use_checkpoint and self.training:
             lr_t = torch.tensor(layer_ratio, device=hidden_states.device)
-            x, gate, topk_idx, topk_w, type_mask, alpha = checkpoint(
+            x, gate, gate_eff, topk_idx, topk_w, type_mask, alpha, eff_top_k, gate_th = checkpoint(
                 self._forward_ckpt, hidden_states, lr_t, attention_mask, use_reentrant=False
             )
         else:
-            x, gate, topk_idx, topk_w, type_mask, alpha = self._forward_impl(hidden_states, layer_ratio, attention_mask)
+            x, gate, gate_eff, topk_idx, topk_w, type_mask, alpha, eff_top_k, gate_th = self._forward_impl(
+                hidden_states, layer_ratio, attention_mask
+            )
 
         info = {
             "gate": gate,
+            "gate_eff": gate_eff,
             "topk_idx": topk_idx,
             "topk_w": topk_w,
             "type_mask": type_mask,
             "alpha": alpha,
+            "effective_top_k": eff_top_k,
+            "gate_threshold": gate_th,
         }
         return x, info
 
@@ -390,4 +579,14 @@ def null_route_loss(layer_infos):
         layer_ratio = li / max(n_layers - 1, 1)
         target_gate = 0.18 + 0.22 * layer_ratio
         total = total + (gate.mean() - target_gate).pow(2)
+    return total / len(layer_infos)
+
+
+def topk_entropy_penalty(layer_infos):
+    total = torch.tensor(0.0, device=layer_infos[0]["topk_w"].device, dtype=torch.float32)
+    for info in layer_infos:
+        tw = torch.nan_to_num(info["topk_w"].float(), nan=0.0, posinf=1.0, neginf=0.0).clamp_min(1e-6)
+        tw = tw / tw.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        ent = -(tw * tw.log()).sum(dim=-1).mean()
+        total = total + ent
     return total / len(layer_infos)
