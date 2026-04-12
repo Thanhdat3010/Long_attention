@@ -1,0 +1,57 @@
+---
+# Default Configuration for LongAttention Experiments
+# Override any value via CLI argparse flags in run_experiment.py
+
+# ══════════════════════════════════════════
+# Data
+# ══════════════════════════════════════════
+data:
+  data_dir: "./data"
+  lang_pair: "en-fr"        # Options: en-fr, fr-en, de-en, en-de
+  max_train_samples: null   # null = use full dataset
+  max_val_samples: null
+  max_test_samples: null
+
+# ══════════════════════════════════════════
+# Model
+# ══════════════════════════════════════════
+model:
+  backbone: "Qwen/Qwen2-1.5B"    # or Qwen/Qwen2-7B for 7B scale
+  attention_type: "standard"      # "standard" | "long_attention"
+  device_map: "auto"
+  dtype: "float16"                # float16 | bfloat16 | float32
+  freeze_backbone: false
+
+# ══════════════════════════════════════════
+# LongAttention Module
+# ══════════════════════════════════════════
+long_attention:
+  local_window_size: 512   # W — local branch window (tokens)
+  top_k: 64                # K — Top-K positions for long-range retrieval
+  bottleneck_ratio: 0.25   # FunctionalDecomposer gate head compression
+  dropout_prob: 0.0        # Attention dropout in both branches
+
+# ══════════════════════════════════════════
+# Sequence Lengths
+# ══════════════════════════════════════════
+sequence:
+  max_source_length: 256   # Max prompt tokens
+  max_target_length: 256   # Max generation / label tokens
+
+# ══════════════════════════════════════════
+# Training
+# ══════════════════════════════════════════
+training:
+  batch_size: 4
+  learning_rate: 2.0e-5
+  epochs: 3
+  seed: 42
+  use_comet: true           # false = skip COMET (faster eval)
+
+# ══════════════════════════════════════════
+# Output
+# ══════════════════════════════════════════
+output:
+  output_dir: "./outputs"
+  # Final dir is built automatically as:
+  # outputs/{model_name}/{attention_type}_lr{lr}_bs{batch_size}/

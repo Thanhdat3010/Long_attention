@@ -1,8 +1,28 @@
-torch>=2.0
-transformers>=4.30
-datasets>=2.14
-sacrebleu>=2.3
-rouge-score>=0.1.2
-numpy>=1.24
-tqdm>=4.65
-psutil>=5.9
+# Core ML Framework
+torch>=2.1.0
+torchvision>=0.16.0
+
+# HuggingFace Ecosystem
+transformers>=4.40.0
+datasets>=2.18.0
+evaluate>=0.4.1
+accelerate>=0.28.0
+tokenizers>=0.15.0
+
+# Translation Metrics
+sacrebleu>=2.3.1
+unbabel-comet>=2.2.1
+
+# Tokenization Utilities
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Utilities
+tqdm>=4.66.0
+pyyaml>=6.0
+colorlog>=6.7.0
+einops>=0.7.0
