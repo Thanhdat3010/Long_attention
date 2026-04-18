@@ -297,8 +297,9 @@ def make_compute_metrics(
         if len(preds.shape) == 3: # Logits case
             preds = np.argmax(preds, axis=-1)
             
-        # Replace -100 in labels as we can't decode them
+        # Replace -100 in labels and preds as the fast tokenizer can't decode them
         labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        preds = np.where(preds != -100, preds, tokenizer.pad_token_id)
         
         # Decode to strings
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)

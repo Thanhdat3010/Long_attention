@@ -279,6 +279,7 @@ def build_training_args(
         do_eval=True,
         evaluation_strategy="epoch",
         save_strategy="epoch",
+        logging_strategy="epoch",
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -287,7 +288,6 @@ def build_training_args(
         num_train_epochs=args.epochs,
         lr_scheduler_type="linear",
         warmup_ratio=0.1,
-        logging_steps=500,
         predict_with_generate=True, # Critical for BLEU evaluation
         generation_max_length=args.max_target_length,
         fp16=(args.dtype == "float16"),
@@ -297,6 +297,7 @@ def build_training_args(
         metric_for_best_model="eval_sacrebleu",
         greater_is_better=True,
         report_to="tensorboard",
+        disable_tqdm=False, # Ensure progress bars are visible
     )
 
 
