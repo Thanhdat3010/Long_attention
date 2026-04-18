@@ -16,6 +16,7 @@ from transformers import AutoTokenizer, PreTrainedModel, BartForConditionalGener
 
 from .long_attention import LongAttention
 from .local_attention import LocalSlidingWindowAttention
+from .led_attention import LEDSelfAttention
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ def inject_attention(
     attention_type: str = "long_attention",
     local_window_size: int = 512,
     top_k: int = 64,
+    num_types: int = 3,
     bottleneck_ratio: float = 0.25,
     dropout_prob: float = 0.0,
 ) -> None:
@@ -40,8 +42,8 @@ def inject_attention(
 
     Args:
         model:             BartForConditionalGeneration instance.
-        attention_type:    "vanilla", "sparse", or "long_attention".
-        local_window_size: Window size for Sparse / LongAttention local branch.
+        attention_type:    "vanilla", "led", or "long_attention".
+        local_window_size: Window size for Sliding Window / LongAttention.
     """
     if attention_type == "vanilla":
         logger.info("Using standard BART attention — no injection performed.")
@@ -73,14 +75,24 @@ def inject_attention(
                 num_heads=num_heads,
                 local_window_size=local_window_size,
                 top_k=top_k,
+                num_types=num_types,
                 bottleneck_ratio=bottleneck_ratio,
                 dropout_prob=dropout_prob,
                 layer_idx=idx,
-                bias=True,  # BART uses bias in projections
+                bias=True,
+            ).to(device=device, dtype=dtype)
+            
+        elif attention_type == "led":
+            new_attn = LEDSelfAttention(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                window_size=local_window_size,
+                dropout_prob=dropout_prob,
+                bias=True,
             ).to(device=device, dtype=dtype)
             
         elif attention_type == "sparse":
-            # Using Sliding Window logic identical to Longformer's local window
+            # Keep for backward compatibility or remove if not needed
             new_attn = LocalSlidingWindowAttention(
                 hidden_size=hidden_size,
                 num_heads=num_heads,
@@ -126,6 +138,7 @@ def build_model(
         attention_type=attention_type,
         local_window_size=long_attention_config.get("local_window_size", 512),
         top_k=long_attention_config.get("top_k", 64),
+        num_types=long_attention_config.get("num_types", 3),
         bottleneck_ratio=long_attention_config.get("bottleneck_ratio", 0.25),
         dropout_prob=long_attention_config.get("dropout_prob", 0.0),
     )

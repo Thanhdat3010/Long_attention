@@ -140,121 +140,148 @@ class Seq2SeqDocumentDataset(Dataset):
 # Compute Metrics Factory
 # ---------------------------------------------------------------------------
 
-def make_compute_metrics(
-    tokenizer: PreTrainedTokenizerBase,
-    sources_for_comet: Optional[List[str]] = None,
-    use_comet: bool = True,
-) -> Callable:
+from transformers import (
+    DataCollatorForSeq2Seq,
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+    DataCollatorWithPadding,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    EarlyStoppingCallback,
+)
+from transformers.data.data_collator import DataCollatorForLanguageModeling
+from torch.utils.data import Dataset
+
+from .metrics import (
+    compute_sacrebleu,
+    compute_chrf,
+    compute_comet,
+    compute_attention_sink_ratio,
+)
+from .callbacks import (
+    AttentionSinkCallback,
+    GateDiversityCallback,
+    CheckpointMetadataCallback,
+)
+from transformers.trainer_callback import TrainerCallback
+from ..utils.io_utils import save_metrics, save_model_artifacts
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# BART Denoising Collator for SPT (Text Infilling)
+# ---------------------------------------------------------------------------
+
+class BARTDenoisingCollator:
     """
-    Build a ``compute_metrics`` function compatible with HuggingFace Trainer.
-
-    The returned function decodes model predictions and computes:
-      - SacreBLEU
-      - ChrF++
-      - COMET (if ``use_comet=True`` and sources provided)
-
-    Args:
-        tokenizer:          Tokenizer for decoding predictions.
-        sources_for_comet:  Source sentences for COMET (needed for DA model).
-        use_comet:          Whether to include COMET computation.
-
-    Returns:
-        A callable ``compute_metrics(eval_pred) → Dict[str, float]``.
+    Data Collator for BART Self Pre-training (SPT).
+    Implements Text Infilling: random spans of tokens are replaced with a single [MASK].
     """
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, mask_ratio: float = 0.3, poisson_lambda: float = 3.0):
+        self.tokenizer = tokenizer
+        self.mask_ratio = mask_ratio
+        self.poisson_lambda = poisson_lambda
 
-    def compute_metrics(eval_pred) -> Dict[str, float]:
-        predictions, labels = eval_pred
-
-        # Convert logits → token IDs if needed
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-        if predictions.ndim == 3:
-            predictions = predictions.argmax(-1)
-
-        # Replace -100 (padding) in labels and predictions with pad_token_id
-        labels_for_decode = np.where(labels != -100, labels, tokenizer.pad_token_id)
-        predictions_for_decode = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
-
-        # Decode predictions and references
-        decoded_preds: List[str] = tokenizer.batch_decode(
-            predictions_for_decode, skip_special_tokens=True
+    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Concatenate source and target for unsupervised denoising if they are separate,
+        # or just use source if it's already long. For DocMT, we use the source document.
+        texts = [ex["source"] for ex in examples]
+        
+        # Tokenize
+        inputs = self.tokenizer(
+            texts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=self.tokenizer.model_max_length
         )
-        decoded_labels: List[str] = tokenizer.batch_decode(
-            labels_for_decode, skip_special_tokens=True
-        )
-
-        # Strip leading/trailing whitespace
-        decoded_preds = [p.strip() for p in decoded_preds]
-        decoded_labels = [l.strip() for l in decoded_labels]
-
-        metrics: Dict[str, float] = {}
-        metrics.update(compute_sacrebleu(decoded_preds, decoded_labels))
-        metrics.update(compute_chrf(decoded_preds, decoded_labels))
-
-        if use_comet and sources_for_comet is not None:
-            # COMET expects a source list matching the eval batch size
-            batch_sources = sources_for_comet[: len(decoded_preds)]
-            metrics.update(
-                compute_comet(batch_sources, decoded_preds, decoded_labels)
-            )
-
-        return metrics
-
-    return compute_metrics
+        
+        input_ids = inputs["input_ids"]
+        labels = input_ids.clone()
+        
+        # Create mask
+        # Simplified Text Infilling: Mask tokens with mask_ratio probability
+        # In a real BART SPT, you'd use Poisson distribution for spans.
+        # Here we use a standard MLM-like collator for simplicity but targeting BART.
+        probability_matrix = torch.full(labels.shape, self.mask_ratio)
+        special_tokens_mask = [
+            self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
+        ]
+        probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
+        
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        
+        # BART specific: labels stay original, input_ids get [MASK]
+        input_ids[masked_indices] = self.tokenizer.mask_token_id if self.tokenizer.mask_token_id is not None else self.tokenizer.convert_tokens_to_ids("<mask>")
+        
+        # Replace -100 in labels for positions that are NOT masked? 
+        # No, for BART denoising, the decoder predicts the FULL uncorrupted sequence.
+        # So labels = original input_ids.
+        
+        return {
+            "input_ids": input_ids,
+            "attention_mask": inputs["attention_mask"],
+            "labels": labels
+        }
 
 
 # ---------------------------------------------------------------------------
-# Training Arguments Builder
+# LongAttentionTrainer: Custom Trainer with Research Losses
 # ---------------------------------------------------------------------------
 
-def build_training_args(args: Namespace, output_dir: str, gradient_accumulation_steps: int = 1) -> Seq2SeqTrainingArguments:
+class LongAttentionTrainer(Seq2SeqTrainer):
     """
-    Build ``Seq2SeqTrainingArguments`` from an argparse Namespace.
-
-    Args:
-        args:       Parsed argparse arguments.
-        output_dir: Resolved experiment output directory.
-        gradient_accumulation_steps: Steps for gradient accumulation.
-
-    Returns:
-        Configured ``Seq2SeqTrainingArguments``.
+    Custom Seq2SeqTrainer for LongAttention research.
+    Integrates Diversity Regularization and Null-Route Calibration.
     """
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    use_fp16 = False 
+    def __init__(self, *args, diversity_weight: float = 0.1, null_weight: float = 0.01, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.diversity_weight = diversity_weight
+        self.null_weight = null_weight
 
-    return Seq2SeqTrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        warmup_ratio=0.05,
-        weight_decay=0.01,
-        lr_scheduler_type="cosine",
-        logging_dir=f"{output_dir}/logs",
-        logging_steps=10, # Log more frequently to see memory
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="sacrebleu",
-        greater_is_better=True,
-        predict_with_generate=True,
-        generation_max_length=args.max_target_length,
-        generation_num_beams=4,
-        fp16=use_fp16,
-        bf16=use_bf16,
-        dataloader_num_workers=2,
-        report_to=["none"],
-        save_total_limit=3,
-        push_to_hub=False,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        gradient_checkpointing=True, # Bật GC để tiết kiệm VRAM cho long sequences
-        label_smoothing_factor=0.1,
-    )
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """
+        Compute standard Seq2Seq loss + LongAttention research losses.
+        """
+        outputs = model(**inputs)
+        # Standard CrossEntropy loss
+        loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
+        
+        # Collect Research Losses from layers
+        # We look for 'diversity_loss' and 'gate_val' attached to encoder outputs
+        diversity_loss = torch.tensor(0.0, device=loss.device)
+        gate_val = torch.tensor(0.0, device=loss.device)
+        count = 0
+        
+        # Search in the model's encoder for LongAttention layers
+        for module in model.modules():
+            from ..models.long_attention import LongAttention
+            if isinstance(module, LongAttention):
+                if hasattr(module, 'last_diversity_loss'):
+                    diversity_loss += module.last_diversity_loss
+                    gate_val += module.last_gate_val
+                    count += 1
+        
+        if count > 0:
+            diversity_loss /= count
+            gate_val /= count
+            
+            # 1. Diversity Loss: Encourage types to stay separate
+            loss += self.diversity_weight * diversity_loss
+            
+            # 2. Null-Route Calibration: Penalize large gate values (encourage sparsity)
+            # This is the "Reward for not opening routes"
+            loss += self.null_weight * gate_val
+            
+            if self.state.global_step % 50 == 0:
+                logger.debug(f"Step {self.state.global_step} | DivLoss: {diversity_loss:.4f} | GateVal: {gate_val:.4f}")
+
+        return (loss, outputs) if return_outputs else loss
 
 
 # ---------------------------------------------------------------------------
-# Main Training Function
+# Training Pipeline
 # ---------------------------------------------------------------------------
 
 def run_training(
@@ -266,57 +293,39 @@ def run_training(
     output_dir: str,
     test_dataset: Optional[Dataset] = None,
     gradient_accumulation_steps: int = 1,
+    is_spt: bool = False,
 ) -> Dict[str, Any]:
     """
-    Execute the full training and evaluation pipeline.
-
-    Steps:
-    1. Build ``Seq2SeqTrainingArguments``.
-    2. Construct ``compute_metrics`` with source sentences for COMET.
-    3. Register callbacks: AttentionSink, GateDiversity, CheckpointMetadata.
-    4. Initialise and run ``Seq2SeqTrainer``.
-    5. Run final evaluation and return metric dict.
-
-    Args:
-        model:         The (possibly patched) Qwen model.
-        tokenizer:     Corresponding tokenizer.
-        train_dataset: Training split Dataset.
-        val_dataset:   Validation split Dataset.
-        args:          Full argparse Namespace.
-        output_dir:    Resolved output directory path.
-
-    Returns:
-        Dict of final evaluation metrics.
+    Execute the training pipeline (SPT or Fine-tuning).
     """
     training_args = build_training_args(args, output_dir, gradient_accumulation_steps)
-
-    # Collect source sentences from val set for COMET
-    val_sources: Optional[List[str]] = None
-    if hasattr(val_dataset, "data"):
-        val_sources = val_dataset.data["source"].tolist()
-
-    compute_metrics = make_compute_metrics(
-        tokenizer=tokenizer,
-        sources_for_comet=val_sources,
-        use_comet=getattr(args, "use_comet", True),
-    )
-
-    # Collator: standard seq2seq padding
-    collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+    
+    # SPT uses a different collator and objective
+    if is_spt:
+        logger.info("Configuring for Self Pre-training (SPT)...")
+        collator = BARTDenoisingCollator(tokenizer)
+        training_args.predict_with_generate = False # Don't evaluate with BLEU during SPT
+        compute_metrics = None
+    else:
+        collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+        val_sources = val_dataset.data["source"].tolist() if hasattr(val_dataset, "data") else None
+        compute_metrics = make_compute_metrics(
+            tokenizer=tokenizer,
+            sources_for_comet=val_sources,
+            use_comet=getattr(args, "use_comet", True),
+        )
 
     # Callbacks
-    metadata_dict = vars(args)
     callbacks = [
         AttentionSinkCallback(output_dir=output_dir, log_to_file=True),
         GPUMemoryCallback(),
-        CheckpointMetadataCallback(metadata=metadata_dict),
+        CheckpointMetadataCallback(metadata=vars(args)),
         EarlyStoppingCallback(early_stopping_patience=3),
     ]
-    # Only add GateDiversity callback when LongAttention is active
     if args.attention_type == "long_attention":
         callbacks.append(GateDiversityCallback(output_dir=output_dir, log_to_file=True))
 
-    trainer = Seq2SeqTrainer(
+    trainer = LongAttentionTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -325,42 +334,36 @@ def run_training(
         data_collator=collator,
         compute_metrics=compute_metrics,
         callbacks=callbacks,
+        diversity_weight=getattr(args, "diversity_weight", 0.1),
+        null_weight=getattr(args, "null_weight", 0.01),
     )
 
     # ------ Train ------
-    logger.info("Starting training… output_dir=%s", output_dir)
+    logger.info("Starting %s training...", "SPT" if is_spt else "Fine-tuning")
     train_result = trainer.train()
     trainer.log_metrics("train", train_result.metrics)
     trainer.save_metrics("train", train_result.metrics)
-    
-    # Save the final model and tokenizer
-    logger.info("Saving model and tokenizer to %s", output_dir)
     trainer.save_model(output_dir)
 
-    # ------ Final Evaluation on Val ------
-    logger.info("Running final evaluation (Val)…")
-    eval_metrics = trainer.evaluate()
-    trainer.log_metrics("eval", eval_metrics)
-    trainer.save_metrics("eval", eval_metrics)
+    # ------ Evaluation ------
+    eval_metrics = {}
+    if not is_spt:
+        logger.info("Running final evaluation (Val)...")
+        eval_metrics = trainer.evaluate()
+        trainer.log_metrics("eval", eval_metrics)
+        trainer.save_metrics("eval", eval_metrics)
 
-    # ------ Final Evaluation on Test ------
-    if test_dataset is not None:
-        logger.info("Running final evaluation (Test)…")
-        
-        # Override compute_metrics closure to use test_sources instead of val_sources
-        test_sources: Optional[List[str]] = None
-        if hasattr(test_dataset, "data"):
-            test_sources = test_dataset.data["source"].tolist()
-        
-        trainer.compute_metrics = make_compute_metrics(
-            tokenizer=tokenizer,
-            sources_for_comet=test_sources,
-            use_comet=getattr(args, "use_comet", True),
-        )
-        
-        test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
-        trainer.log_metrics("test", test_metrics)
-        trainer.save_metrics("test", test_metrics)
-        eval_metrics.update(test_metrics)
+        if test_dataset is not None:
+            logger.info("Running final evaluation (Test)...")
+            test_sources = test_dataset.data["source"].tolist() if hasattr(test_dataset, "data") else None
+            trainer.compute_metrics = make_compute_metrics(
+                tokenizer=tokenizer,
+                sources_for_comet=test_sources,
+                use_comet=getattr(args, "use_comet", True),
+            )
+            test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
+            trainer.log_metrics("test", test_metrics)
+            trainer.save_metrics("test", test_metrics)
+            eval_metrics.update(test_metrics)
 
     return {**train_result.metrics, **eval_metrics}

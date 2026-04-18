@@ -1,44 +1,6 @@
 #!/usr/bin/env python3
 """
 run_experiment.py — Main Entry Point for LongAttention NMT Experiments.
-
-This script orchestrates the full experimental pipeline:
-  1. Parse command-line arguments.
-  2. Set up logging and output directory.
-  3. Download / load WMT14 data (with CSV caching).
-  4. Load Qwen backbone and (optionally) inject LongAttention.
-  5. Build datasets and run training.
-  6. Save model, tokenizer, and final metrics.
-
-Usage Examples
---------------
-# Standard Transformer baseline (1.5B):
-python scripts/run_experiment.py \\
-    --backbone Qwen/Qwen2-1.5B \\
-    --attention_type standard \\
-    --lang_pair en-fr \\
-    --epochs 3 \\
-    --batch_size 4 \\
-    --learning_rate 2e-5
-
-# LongAttention experiment (1.5B):
-python scripts/run_experiment.py \\
-    --backbone Qwen/Qwen2-1.5B \\
-    --attention_type long_attention \\
-    --lang_pair en-fr \\
-    --epochs 3 \\
-    --batch_size 4 \\
-    --learning_rate 2e-5 \\
-    --top_k 64 \\
-    --local_window_size 512
-
-# 7B scale with lower batch size:
-python scripts/run_experiment.py \\
-    --backbone Qwen/Qwen2-7B \\
-    --attention_type long_attention \\
-    --batch_size 2 \\
-    --learning_rate 1e-5 \\
-    --max_train_samples 100000
 """
 
 import argparse
@@ -140,13 +102,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     model_grp.add_argument(
         "--attention_type",
         type=str,
-        choices=["vanilla", "sparse", "long_attention"],
+        choices=["vanilla", "led", "long_attention"],
         default="vanilla",
         help=(
             "Attention type to use. "
             "'vanilla' = unmodified BART; "
-            "'sparse' = sliding window local attention; "
-            "'long_attention' = LongAttention layers."
+            "'led' = sliding window + global tokens; "
+            "'long_attention' = LongAttention v2 layers."
         ),
     )
     model_grp.add_argument(
@@ -175,19 +137,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--top_k",
         type=int,
         default=64,
-        help="Number of Top-K positions for bidirectional long-range retrieval.",
+        help="Number of Top-K positions for long-range retrieval.",
+    )
+    la_grp.add_argument(
+        "--num_types",
+        type=int,
+        default=3,
+        help="Number of dependency types for LongAttention v2.",
     )
     la_grp.add_argument(
         "--bottleneck_ratio",
         type=float,
         default=0.25,
-        help="Bottleneck ratio for the FunctionalDecomposer gate head.",
+        help="Bottleneck ratio for gating modules.",
     )
     la_grp.add_argument(
         "--dropout_prob",
         type=float,
-        default=0.0,
-        help="Dropout applied to attention weights inside LongAttention.",
+        default=0.1,
+        help="Dropout probability.",
     )
 
     # ── Sequence Lengths ────────────────────────────────────────────────────
@@ -268,6 +236,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Enable DEBUG-level logging.",
     )
 
+    # ── Research Losses ──────────────────────────────────────────────────────
+    res_grp = parser.add_argument_group("Research Regularization")
+    res_grp.add_argument(
+        "--diversity_weight",
+        type=float,
+        default=0.1,
+        help="Weight for type diversity loss.",
+    )
+    res_grp.add_argument(
+        "--null_weight",
+        type=float,
+        default=0.01,
+        help="Weight for null-route (gate sparsity) calibration.",
+    )
+    res_grp.add_argument(
+        "--run_spt",
+        action="store_true",
+        default=False,
+        help="Run Self Pre-training (Text Infilling) before fine-tuning.",
+    )
+    res_grp.add_argument(
+        "--spt_epochs",
+        type=int,
+        default=1,
+        help="Number of epochs for SPT phase.",
+    )
+
     return parser
 
 
@@ -346,6 +341,7 @@ def main() -> None:
     long_attention_config = {
         "local_window_size": args.local_window_size,
         "top_k": args.top_k,
+        "num_types": args.num_types,
         "bottleneck_ratio": args.bottleneck_ratio,
         "dropout_prob": args.dropout_prob,
     }
@@ -386,8 +382,34 @@ def main() -> None:
     val_ds.data = dataframes["val"]
     test_ds.data = dataframes["test"]
 
-    # ── Step 5: Train & Evaluate ──────────────────────────────────────────────
-    logger.info("[5/5] Starting training pipeline…")
+    # ── Step 5 & 6: Train & Evaluate ──────────────────────────────────────────
+    # Stage 1: SPT (Optional)
+    if args.run_spt:
+        logger.info("[5/6] Starting Stage 1: Self Pre-training (SPT)…")
+        spt_output_dir = f"{output_dir}/spt"
+        
+        # Override epochs for SPT phase
+        original_epochs = args.epochs
+        args.epochs = args.spt_epochs
+        
+        run_training(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_ds,
+            val_dataset=val_ds,
+            args=args,
+            output_dir=spt_output_dir,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            is_spt=True,
+        )
+        # Restore epochs for Stage 2
+        args.epochs = original_epochs
+        logger.info("SPT completed. Moving to Stage 2.")
+    else:
+        logger.info("[5/6] Skipping Stage 1 (SPT).")
+
+    # Stage 2: Fine-tuning
+    logger.info("[6/6] Starting Stage 2: Fine-tuning…")
     args.use_comet = not args.no_comet  # forward to trainer
     final_metrics = run_training(
         model=model,
@@ -398,6 +420,7 @@ def main() -> None:
         output_dir=output_dir,
         test_dataset=test_ds,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        is_spt=False, # FT stage
     )
 
     # ── Save Artifacts ────────────────────────────────────────────────────────
