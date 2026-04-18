@@ -48,9 +48,36 @@ from .callbacks import (
     GateDiversityCallback,
     CheckpointMetadataCallback,
 )
+from transformers.trainer_callback import TrainerCallback
 from ..utils.io_utils import save_metrics, save_model_artifacts
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GPUMemoryCallback: Tracks and logs VRAM usage
+# ---------------------------------------------------------------------------
+
+class GPUMemoryCallback(TrainerCallback):
+    """
+    Callback that logs GPU memory usage at the end of each log step.
+    Helps diagnose OOM issues by showing 'Reserved' vs 'Allocated' memory.
+    """
+    def on_log(self, args, state, control, **kwargs):
+        if torch.cuda.is_available():
+            # Get current device
+            device = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(device) / (1024**3)
+            reserved = torch.cuda.memory_reserved(device) / (1024**3)
+            max_allocated = torch.cuda.max_memory_allocated(device) / (1024**3)
+            
+            logger.info(
+                f"[GPU Memory] Step {state.global_step}: "
+                f"Allocated: {allocated:.2f}GB | "
+                f"Reserved: {reserved:.2f}GB | "
+                f"Peak: {max_allocated:.2f}GB"
+            )
+
 
 
 # ---------------------------------------------------------------------------
@@ -144,12 +171,13 @@ def make_compute_metrics(
         if predictions.ndim == 3:
             predictions = predictions.argmax(-1)
 
-        # Replace -100 (padding) in labels with pad_token_id for decoding
+        # Replace -100 (padding) in labels and predictions with pad_token_id
         labels_for_decode = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        predictions_for_decode = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
 
         # Decode predictions and references
         decoded_preds: List[str] = tokenizer.batch_decode(
-            predictions, skip_special_tokens=True
+            predictions_for_decode, skip_special_tokens=True
         )
         decoded_labels: List[str] = tokenizer.batch_decode(
             labels_for_decode, skip_special_tokens=True
@@ -179,21 +207,20 @@ def make_compute_metrics(
 # Training Arguments Builder
 # ---------------------------------------------------------------------------
 
-def build_training_args(args: Namespace, output_dir: str) -> Seq2SeqTrainingArguments:
+def build_training_args(args: Namespace, output_dir: str, gradient_accumulation_steps: int = 1) -> Seq2SeqTrainingArguments:
     """
     Build ``Seq2SeqTrainingArguments`` from an argparse Namespace.
 
     Args:
         args:       Parsed argparse arguments.
         output_dir: Resolved experiment output directory.
+        gradient_accumulation_steps: Steps for gradient accumulation.
 
     Returns:
         Configured ``Seq2SeqTrainingArguments``.
     """
-    # A100 supports bfloat16 natively — no gradient scaler issues.
-    # fp16 + pre-loaded float16 model = ValueError (cannot unscale FP16 grads).
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    use_fp16 = False  # always off — model loaded in bf16/fp16 already
+    use_fp16 = False 
 
     return Seq2SeqTrainingArguments(
         output_dir=output_dir,
@@ -205,7 +232,7 @@ def build_training_args(args: Namespace, output_dir: str) -> Seq2SeqTrainingArgu
         weight_decay=0.01,
         lr_scheduler_type="cosine",
         logging_dir=f"{output_dir}/logs",
-        logging_steps=50,
+        logging_steps=10, # Log more frequently to see memory
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
@@ -220,8 +247,8 @@ def build_training_args(args: Namespace, output_dir: str) -> Seq2SeqTrainingArgu
         report_to=["none"],
         save_total_limit=3,
         push_to_hub=False,
-        gradient_accumulation_steps=max(1, 16 // args.batch_size),
-        gradient_checkpointing=False,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=True, # Bật GC để tiết kiệm VRAM cho long sequences
         label_smoothing_factor=0.1,
     )
 
@@ -237,6 +264,8 @@ def run_training(
     val_dataset: Dataset,
     args: Namespace,
     output_dir: str,
+    test_dataset: Optional[Dataset] = None,
+    gradient_accumulation_steps: int = 1,
 ) -> Dict[str, Any]:
     """
     Execute the full training and evaluation pipeline.
@@ -259,7 +288,7 @@ def run_training(
     Returns:
         Dict of final evaluation metrics.
     """
-    training_args = build_training_args(args, output_dir)
+    training_args = build_training_args(args, output_dir, gradient_accumulation_steps)
 
     # Collect source sentences from val set for COMET
     val_sources: Optional[List[str]] = None
@@ -279,7 +308,9 @@ def run_training(
     metadata_dict = vars(args)
     callbacks = [
         AttentionSinkCallback(output_dir=output_dir, log_to_file=True),
+        GPUMemoryCallback(),
         CheckpointMetadataCallback(metadata=metadata_dict),
+        EarlyStoppingCallback(early_stopping_patience=3),
     ]
     # Only add GateDiversity callback when LongAttention is active
     if args.attention_type == "long_attention":
@@ -306,9 +337,30 @@ def run_training(
     logger.info("Saving model and tokenizer to %s", output_dir)
     trainer.save_model(output_dir)
 
-    # ------ Final Evaluation ------
-    logger.info("Running final evaluation…")
+    # ------ Final Evaluation on Val ------
+    logger.info("Running final evaluation (Val)…")
     eval_metrics = trainer.evaluate()
     trainer.log_metrics("eval", eval_metrics)
+    trainer.save_metrics("eval", eval_metrics)
+
+    # ------ Final Evaluation on Test ------
+    if test_dataset is not None:
+        logger.info("Running final evaluation (Test)…")
+        
+        # Override compute_metrics closure to use test_sources instead of val_sources
+        test_sources: Optional[List[str]] = None
+        if hasattr(test_dataset, "data"):
+            test_sources = test_dataset.data["source"].tolist()
+        
+        trainer.compute_metrics = make_compute_metrics(
+            tokenizer=tokenizer,
+            sources_for_comet=test_sources,
+            use_comet=getattr(args, "use_comet", True),
+        )
+        
+        test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
+        trainer.log_metrics("test", test_metrics)
+        trainer.save_metrics("test", test_metrics)
+        eval_metrics.update(test_metrics)
 
     return {**train_result.metrics, **eval_metrics}

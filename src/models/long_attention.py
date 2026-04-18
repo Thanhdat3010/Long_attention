@@ -74,7 +74,12 @@ class FunctionalDecomposer(nn.Module):
         bottleneck = max(1, int(hidden_size * bottleneck_ratio))
 
         # Gate head: projects hidden → scalar routing score
-        self.gate_proj = nn.Sequential(
+        self.gate_proj_local = nn.Sequential(
+            nn.Linear(hidden_size, bottleneck, bias=False),
+            nn.SiLU(),
+            nn.Linear(bottleneck, 1, bias=False),
+        )
+        self.gate_proj_global = nn.Sequential(
             nn.Linear(hidden_size, bottleneck, bias=False),
             nn.SiLU(),
             nn.Linear(bottleneck, 1, bias=False),
@@ -89,13 +94,14 @@ class FunctionalDecomposer(nn.Module):
         self.affix_codebook = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, global_context: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Decompose hidden states into Semantic Root and Functional Affix streams.
 
         Args:
             hidden_states: Tensor of shape (B, T, D).
+            global_context: Tensor of shape (B, 1, D).
 
         Returns:
             Tuple:
@@ -103,8 +109,15 @@ class FunctionalDecomposer(nn.Module):
                 A_encoded:   Functional Affix encoding (B, T, D).
                 gate_score:  Per-token gate probability in [0,1] (B, T, 1).
         """
+        # Context-Aware Gate Score with Temperature Sharpening
+        local_logits = self.gate_proj_local(hidden_states)     # (B, T, 1)
+        global_logits = self.gate_proj_global(global_context)  # (B, 1, 1)
+        
+        gate_logits = local_logits + global_logits
+        temperature = 0.5
+        
         # gate_score ∈ (0, 1): high = Semantic Root, low = Functional Affix
-        gate_score = torch.sigmoid(self.gate_proj(hidden_states))  # (B, T, 1)
+        gate_score = torch.sigmoid(gate_logits / temperature)  # (B, T, 1)
 
         # Semantic Root stream — only activated tokens contribute significantly
         root_features = self.root_transform(hidden_states)   # (B, T, D) — f_θ(S)
@@ -259,8 +272,9 @@ class BidirectionalTopKRetrieval(nn.Module):
             mask = corr_scores < threshold
             corr_scores = corr_scores.masked_fill(mask, float("-inf"))
 
-        # Normalise over retrieved positions
-        attn_weights = F.softmax(corr_scores, dim=-1)
+        # Normalise over retrieved positions with Temperature Sharpening
+        attn_temperature = 0.5
+        attn_weights = F.softmax(corr_scores / attn_temperature, dim=-1)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         attn_weights = self.attn_dropout(attn_weights)
 
@@ -343,9 +357,9 @@ class LongAttention(nn.Module):
         )
 
         # Step 2 — Gating Modulation Mechanism: G_score = σ(X W_θ)
-        # Implemented INSIDE FunctionalDecomposer.gate_proj above.
-        # Here we expose an explicit modulation weight W_θ for clarity:
-        self.W_theta = nn.Linear(hidden_size, hidden_size, bias=False)  # explicit W_θ
+        # We split the modulation into local and global context weights
+        self.W_theta_local = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_theta_global = nn.Linear(hidden_size, hidden_size, bias=False)
 
         # Step 3 — Compressed Gist & Reservoir
         self.gist_reservoir = GistReservoir(
@@ -414,14 +428,21 @@ class LongAttention(nn.Module):
         # A_local: (B, T, D)
 
         # ── Step 2: Gated Functional Decomposer ─────────────────────────────
+        # Extract global context to empower routing mechanisms
+        global_context = hidden_states.mean(dim=1, keepdim=True) # (B, 1, D)
+
         # R = Semantic Root encoding, A = Functional Affix encoding
-        R_encoded, A_encoded, gate_score_decomp = self.decomposer(hidden_states)
+        R_encoded, A_encoded, gate_score_decomp = self.decomposer(hidden_states, global_context)
         # R_encoded: (B, T, D), A_encoded: (B, T, D), gate_score_decomp: (B, T, 1)
 
         # ── Step 3: Explicit Gating Modulation G_score = σ(X W_θ) ──────────
-        # This is the "query-dependent" gate from the proposal (§4.1).
-        # It acts as a content-based filter before the gist is built.
-        G_score = torch.sigmoid(self.W_theta(hidden_states))  # (B, T, D)
+        # Context-Aware explicit routing gate
+        mod_local = self.W_theta_local(hidden_states)     # (B, T, D)
+        mod_global = self.W_theta_global(global_context)  # (B, 1, D)
+        
+        mod_logits = mod_local + mod_global
+        temperature = 0.5
+        G_score = torch.sigmoid(mod_logits / temperature) # (B, T, D)
 
         # Apply the explicit gate to the semantic root encoding
         R_gated = G_score * R_encoded  # (B, T, D)

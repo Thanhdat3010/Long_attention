@@ -41,14 +41,15 @@ CSV_NAMES: Dict[str, str] = {
 # CSV Caching Utilities
 # ---------------------------------------------------------------------------
 
-def _csv_path(data_dir: str, split: str) -> Path:
-    """Return the canonical CSV path for a given split."""
-    return Path(data_dir) / CSV_NAMES[split]
+def _csv_path(data_dir: str, dataset_name: str, lang_pair: str, split: str) -> Path:
+    """Return the canonical CSV path for a given split, safely nested."""
+    safe_ds = dataset_name.replace("/", "_")
+    return Path(data_dir) / safe_ds / lang_pair / CSV_NAMES[split]
 
 
-def _all_csvs_exist(data_dir: str) -> bool:
+def _all_csvs_exist(data_dir: str, dataset_name: str, lang_pair: str) -> bool:
     """Return True if all three split CSVs already exist on disk."""
-    return all(_csv_path(data_dir, s).is_file() for s in CSV_NAMES)
+    return all(_csv_path(data_dir, dataset_name, lang_pair, s).is_file() for s in CSV_NAMES)
 
 
 def _save_dataframe(df: pd.DataFrame, path: Path) -> None:
@@ -142,6 +143,64 @@ def _extract_translation_rows(
     return df
 
 
+def _extract_dochplt_rows(
+    hf_split,
+    max_rows: Optional[int] = None,
+    group_size: int = 50,
+) -> pd.DataFrame:
+    """
+    Extract perfectly aligned documents from HPLT/DocHPLT.
+    Parses 'alignment' metadata to ensure truncation doesn't break document parity.
+    """
+    sources, targets = [], []
+    
+    for example in hf_split:
+        if max_rows is not None and len(sources) >= max_rows:
+            break
+            
+        src_doc = example.get("src_doc", {})
+        tgt_doc = example.get("tgt_doc", {})
+        src_dict = dict(zip(src_doc.get("ids", []), src_doc.get("sentences", [])))
+        tgt_dict = dict(zip(tgt_doc.get("ids", []), tgt_doc.get("sentences", [])))
+        alignments = example.get("alignment", [])
+        
+        current_src_group, current_tgt_group = [], []
+        chunk_count = 0
+        
+        for align in alignments:
+            s_ids = align.get("src", [])
+            t_ids = align.get("tgt", [])
+            
+            s_sents = [src_dict.get(sid, "").strip() for sid in s_ids]
+            t_sents = [tgt_dict.get(tid, "").strip() for tid in t_ids]
+            
+            s_sent = " ".join(filter(None, s_sents))
+            t_sent = " ".join(filter(None, t_sents))
+            
+            if s_sent and t_sent:
+                    current_src_group.append(s_sent)
+                    current_tgt_group.append(t_sent)
+                    chunk_count += 1
+            
+            if chunk_count >= group_size:
+                sources.append(" ".join(current_src_group))
+                targets.append(" ".join(current_tgt_group))
+                current_src_group, current_tgt_group = [], []
+                chunk_count = 0
+                if max_rows is not None and len(sources) >= max_rows:
+                    break
+                    
+        # Add remainder if any
+        if current_src_group and (max_rows is None or len(sources) < max_rows):
+            sources.append(" ".join(current_src_group))
+            targets.append(" ".join(current_tgt_group))
+
+    df = pd.DataFrame({"source": sources, "target": targets})
+    logger.info("Extracted %d valid chunked documents from DocHPLT.", len(df))
+    return df
+
+
+
 def download_and_cache_dataset(
     data_dir: str,
     dataset_name: str = "iwslt2017",
@@ -165,20 +224,48 @@ def download_and_cache_dataset(
     """
     src_lang, tgt_lang = _parse_lang_pair(lang_pair)
 
+    src_lang, tgt_lang = _parse_lang_pair(lang_pair)
+
     # --- Fast path: load from cache ---
-    if _all_csvs_exist(data_dir):
+    if _all_csvs_exist(data_dir, dataset_name, lang_pair):
+        safe_ds = dataset_name.replace("/", "_")
         logger.info(
-            "All CSV files found in '%s'. Loading from cache (skipping download).",
-            data_dir,
+            "All CSV files found in '%s/%s/%s'. Loading from cache (skipping download).",
+            data_dir, safe_ds, lang_pair
         )
         return {
-            split: _load_dataframe(_csv_path(data_dir, split))
+            split: _load_dataframe(_csv_path(data_dir, dataset_name, lang_pair, split))
             for split in CSV_NAMES
         }
 
     logger.info(
         "CSV cache not found in '%s'. Downloading %s (%s)…", data_dir, dataset_name, lang_pair
     )
+
+    if dataset_name == "HPLT/DocHPLT":
+        # DocHPLT natively only provides 'train' split.
+        tr_n = max_train_rows if max_train_rows is not None else 20000
+        v_n = max_val_rows if max_val_rows is not None else 1000
+        te_n = max_test_rows if max_test_rows is not None else 1000
+        total_needed = tr_n + v_n + te_n
+        
+        logger.info("Loading HPLT/DocHPLT via Streaming Mode to avoid 1TB+ download...")
+        try:
+            raw_datasets = load_dataset(dataset_name, f"{src_lang}-{tgt_lang}", split="train", streaming=True)
+            df_full = _extract_dochplt_rows(raw_datasets, max_rows=total_needed, group_size=group_size)
+        except Exception as e:
+            logger.error("Failed loading DocHPLT: %s", e)
+            raise e
+            
+        dataframes = {}
+        dataframes["train"] = df_full.iloc[:tr_n].copy()
+        dataframes["val"] = df_full.iloc[tr_n:tr_n+v_n].copy()
+        dataframes["test"] = df_full.iloc[tr_n+v_n:].copy()
+        
+        for k, v in dataframes.items():
+            _save_dataframe(v, _csv_path(data_dir, dataset_name, lang_pair, k))
+            
+        return dataframes
 
     if dataset_name == "iwslt2017":
         hf_subset = f"iwslt2017-{src_lang}-{tgt_lang}"
@@ -229,7 +316,7 @@ def download_and_cache_dataset(
             max_rows=max_rows_map[split_name],
             group_size=group_size,
         )
-        _save_dataframe(df, _csv_path(data_dir, split_name))
+        _save_dataframe(df, _csv_path(data_dir, dataset_name, lang_pair, split_name))
         dataframes[split_name] = df
 
     return dataframes

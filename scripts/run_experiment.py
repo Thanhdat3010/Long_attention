@@ -195,13 +195,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     seq_grp.add_argument(
         "--max_source_length",
         type=int,
-        default=256,
+        default=1024,
         help="Maximum token length for source (prompt) sequences.",
     )
     seq_grp.add_argument(
         "--max_target_length",
         type=int,
-        default=256,
+        default=1024,
         help="Maximum token length for target sequences.",
     )
 
@@ -224,6 +224,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Number of training epochs.",
+    )
+    train_grp.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of steps to accumulate gradients before updating weights.",
     )
     train_grp.add_argument(
         "--seed",
@@ -316,6 +322,14 @@ def main() -> None:
         max_test_rows=args.max_test_samples,
         group_size=args.group_size,
     )
+    
+    # Enforce truncation even if loaded from a larger cached CSV
+    if args.max_train_samples is not None:
+        dataframes["train"] = dataframes["train"].head(args.max_train_samples)
+    if args.max_val_samples is not None:
+        dataframes["val"] = dataframes["val"].head(args.max_val_samples)
+    if args.max_test_samples is not None:
+        dataframes["test"] = dataframes["test"].head(args.max_test_samples)
     logger.info(
         "Data ready — train: %d | val: %d | test: %d",
         len(dataframes["train"]),
@@ -360,10 +374,17 @@ def main() -> None:
         src_max_len=args.max_source_length,
         tgt_max_len=args.max_target_length,
     )
-    logger.info("Train samples: %d | Val samples: %d", len(train_ds), len(val_ds))
+    test_ds = Seq2SeqDocumentDataset(
+        dataframe=dataframes["test"],
+        tokenizer=tokenizer,
+        src_max_len=args.max_source_length,
+        tgt_max_len=args.max_target_length,
+    )
+    logger.info("Train: %d | Val: %d | Test: %d", len(train_ds), len(val_ds), len(test_ds))
 
     # Attach raw dataframe for COMET source retrieval
     val_ds.data = dataframes["val"]
+    test_ds.data = dataframes["test"]
 
     # ── Step 5: Train & Evaluate ──────────────────────────────────────────────
     logger.info("[5/5] Starting training pipeline…")
@@ -375,6 +396,8 @@ def main() -> None:
         val_dataset=val_ds,
         args=args,
         output_dir=output_dir,
+        test_dataset=test_ds,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     # ── Save Artifacts ────────────────────────────────────────────────────────

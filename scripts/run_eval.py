@@ -177,9 +177,12 @@ def main() -> None:
         max_train_rows=args.max_samples if args.split == "train" else None,
         group_size=args.group_size,
     )
-    df = dataframes[args.split]
+    # Enforce truncation even if loaded from a larger cached CSV
     if args.max_samples is not None:
-        df = df.head(args.max_samples)
+        for split in dataframes:
+            dataframes[split] = dataframes[split].head(args.max_samples)
+
+    df = dataframes[args.split]
 
     sources = df["source"].tolist()
     references = df["target"].tolist()
