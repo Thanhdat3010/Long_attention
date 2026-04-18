@@ -22,12 +22,9 @@ import math
 import logging
 from typing import Optional, Tuple, Dict
 
-torch = None # placeholder for type checking, will be imported
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .local_attention import LocalSlidingWindowAttention
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +253,7 @@ class LongAttention(nn.Module):
         self.num_types = num_types
 
         # Branch 1: Local Sliding Window
+        from .local_attention import LocalSlidingWindowAttention
         self.local_attention = LocalSlidingWindowAttention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -298,7 +296,7 @@ class LongAttention(nn.Module):
     ) -> Tuple[torch.Tensor, ...]:
         
         # ── Local Branch ──
-        A_local, local_attn_weights = self.local_attention(
+        A_local, local_attn_weights, _ = self.local_attention(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -309,7 +307,7 @@ class LongAttention(nn.Module):
         # ── Long-range Branch ──
         # 1. Necessity Gate g_i
         g_i = self.necessity_gate(hidden_states) # (B, T, 1)
-        self.last_gate_val = g_i.mean().item()
+        self.last_gate_val = g_i.mean() # Keep as tensor for backprop/logging
 
         # 2. Decompose Gist
         global_ctx = hidden_states.mean(dim=1, keepdim=True)
@@ -320,22 +318,19 @@ class LongAttention(nn.Module):
         
         # 4. Typed Retrieval
         A_long, diversity_loss = self.typed_retrieval(hidden_states, K_typed, V_typed)
-        self.last_diversity_loss = diversity_loss.item()
+        self.last_diversity_loss = diversity_loss # Keep as tensor for backprop
         
         # ── Output Integration ──
         # A_i = A_i^local + g_i * A_i^long
         output = self.output_norm(A_local + g_i * A_long)
 
-        outputs = (output, local_attn_weights if output_attentions else None)
-        if use_cache:
-            outputs += (past_key_value,)
-            
-        # Hook for trainer to collect losses
+        # Hook for trainer to collect losses (used in metrics and callbacks)
         if self.training:
             output.diversity_loss = diversity_loss
             output.gate_val = g_i.mean()
 
-        return outputs
+        # BART expects a 3-tuple: (output, attn_weights, past_key_value)
+        return (output, local_attn_weights if output_attentions else None, past_key_value)
 
     def extra_repr(self) -> str:
         return (

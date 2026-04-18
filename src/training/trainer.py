@@ -34,21 +34,10 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
     EarlyStoppingCallback,
+    TrainerCallback,
 )
 from torch.utils.data import Dataset
 
-from .metrics import (
-    compute_sacrebleu,
-    compute_chrf,
-    compute_comet,
-    compute_attention_sink_ratio,
-)
-from .callbacks import (
-    AttentionSinkCallback,
-    GateDiversityCallback,
-    CheckpointMetadataCallback,
-)
-from transformers.trainer_callback import TrainerCallback
 from ..utils.io_utils import save_metrics, save_model_artifacts
 
 logger = logging.getLogger(__name__)
@@ -152,19 +141,6 @@ from transformers import (
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from torch.utils.data import Dataset
 
-from .metrics import (
-    compute_sacrebleu,
-    compute_chrf,
-    compute_comet,
-    compute_attention_sink_ratio,
-)
-from .callbacks import (
-    AttentionSinkCallback,
-    GateDiversityCallback,
-    CheckpointMetadataCallback,
-)
-from transformers.trainer_callback import TrainerCallback
-from ..utils.io_utils import save_metrics, save_model_artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -184,20 +160,24 @@ class BARTDenoisingCollator:
         self.poisson_lambda = poisson_lambda
 
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # Concatenate source and target for unsupervised denoising if they are separate,
-        # or just use source if it's already long. For DocMT, we use the source document.
-        texts = [ex["source"] for ex in examples]
-        
-        # Tokenize
-        inputs = self.tokenizer(
-            texts, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-            max_length=self.tokenizer.model_max_length
-        )
-        
-        input_ids = inputs["input_ids"]
+        # Handle pre-tokenized inputs: Pad them to the same length in the batch
+        if "input_ids" in examples[0]:
+            batch = self.tokenizer.pad(examples, return_tensors="pt")
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+        else:
+            # Fallback for raw text inputs
+            texts = [str(ex.get("source", ex.get("text", ""))) for ex in examples]
+            inputs = self.tokenizer(
+                texts, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True, 
+                max_length=self.tokenizer.model_max_length
+            )
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs["attention_mask"]
+
         labels = input_ids.clone()
         
         # Create mask
@@ -221,7 +201,7 @@ class BARTDenoisingCollator:
         
         return {
             "input_ids": input_ids,
-            "attention_mask": inputs["attention_mask"],
+            "attention_mask": attention_mask,
             "labels": labels
         }
 
@@ -281,6 +261,46 @@ class LongAttentionTrainer(Seq2SeqTrainer):
 
 
 # ---------------------------------------------------------------------------
+# Training Utilities
+# ---------------------------------------------------------------------------
+
+def build_training_args(
+    args: Namespace, 
+    output_dir: str, 
+    gradient_accumulation_steps: int = 1
+) -> Seq2SeqTrainingArguments:
+    """
+    Construct HuggingFace Seq2SeqTrainingArguments from argparse Namespace.
+    """
+    return Seq2SeqTrainingArguments(
+        output_dir=output_dir,
+        overwrite_output_dir=True,
+        do_train=True,
+        do_eval=True,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        weight_decay=0.01,
+        num_train_epochs=args.epochs,
+        lr_scheduler_type="linear",
+        warmup_ratio=0.1,
+        logging_steps=500,
+        predict_with_generate=True, # Critical for BLEU evaluation
+        generation_max_length=args.max_target_length,
+        fp16=(args.dtype == "float16"),
+        bf16=(args.dtype == "bfloat16"),
+        seed=args.seed,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_sacrebleu",
+        greater_is_better=True,
+        report_to="tensorboard",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -301,6 +321,14 @@ def run_training(
     training_args = build_training_args(args, output_dir, gradient_accumulation_steps)
     
     # SPT uses a different collator and objective
+    # Lazy imports to break circular dependency
+    from .metrics import make_compute_metrics
+    from .callbacks import (
+        AttentionSinkCallback,
+        CheckpointMetadataCallback,
+        GateDiversityCallback
+    )
+
     if is_spt:
         logger.info("Configuring for Self Pre-training (SPT)...")
         collator = BARTDenoisingCollator(tokenizer)
@@ -330,7 +358,7 @@ def run_training(
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         data_collator=collator,
         compute_metrics=compute_metrics,
         callbacks=callbacks,

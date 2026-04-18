@@ -265,3 +265,64 @@ def compute_root_fidelity_score(
 
     rfs = (num_both / num_ref).item()
     return {"root_fidelity_score": round(rfs, 4)}
+
+
+# ---------------------------------------------------------------------------
+# Metric Factory for HuggingFace Trainer
+# ---------------------------------------------------------------------------
+
+def make_compute_metrics(
+    tokenizer: Any,
+    sources_for_comet: Optional[List[str]] = None,
+    use_comet: bool = True,
+):
+    """
+    Factory that returns a compute_metrics function for HF Trainer.
+    
+    Args:
+        tokenizer: Tokenizer used to decode predictions and labels.
+        sources_for_comet: Optional list of source strings, required if use_comet=True.
+        use_comet: Whether to attempt computing the COMET metric.
+    """
+    def compute_metrics(eval_preds):
+        logits, labels = eval_preds
+        
+        # If logits is a tuple (standard for some models), the first element is the actual logits
+        if isinstance(logits, tuple):
+            logits = logits[0]
+            
+        # Decode predictions (greedy decoding from logits)
+        # Note: HF Seq2SeqTrainer with predict_with_generate=True sends token IDs, not logits
+        preds = logits
+        if len(preds.shape) == 3: # Logits case
+            preds = np.argmax(preds, axis=-1)
+            
+        # Replace -100 in labels as we can't decode them
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        
+        # Decode to strings
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        
+        # Clean up whitespace
+        decoded_preds = [p.strip() for p in decoded_preds]
+        decoded_labels = [l.strip() for l in decoded_labels]
+        
+        # 1. SacreBLEU
+        results = compute_sacrebleu(decoded_preds, decoded_labels)
+        
+        # 2. ChrF++
+        results.update(compute_chrf(decoded_preds, decoded_labels))
+        
+        # 3. COMET (Requires sources)
+        if use_comet and sources_for_comet is not None:
+            # Match current batch size if trainer sends subsets? 
+            # Usually eval_preds contains the full eval set.
+            if len(sources_for_comet) == len(decoded_preds):
+                results.update(compute_comet(sources_for_comet, decoded_preds, decoded_labels))
+            else:
+                logger.warning("COMET: source/hypo length mismatch. Skipping COMET.")
+                
+        return results
+
+    return compute_metrics

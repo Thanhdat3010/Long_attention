@@ -158,7 +158,5 @@ class LocalSlidingWindowAttention(nn.Module):
         context = torch.matmul(attn_weights, V)  # (B, H, T, dk)
         context = self._merge_heads(context)     # (B, T, D)
         output = self.out_proj(context)
-        outputs = (output, attn_weights if output_attentions else None)
-        if use_cache:
-            outputs += (past_key_value,)
-        return outputs
+        # BART expects a 3-tuple: (output, attn_weights, past_key_value)
+        return (output, attn_weights if output_attentions else None, past_key_value)

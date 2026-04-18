@@ -104,4 +104,6 @@ class LEDSelfAttention(nn.Module):
         context = self._merge_heads(context)
         output = self.out_proj(context)
 
-        return (output, None)
+        # BART expects a 3-tuple: (output, attn_weights, past_key_value)
+        output_attentions = kwargs.get("output_attentions", False)
+        return (output, attn_weights if output_attentions else None, None)

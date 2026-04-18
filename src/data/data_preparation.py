@@ -95,7 +95,7 @@ def _extract_translation_rows(
     hf_split,
     src_lang: str,
     tgt_lang: str,
-    max_rows: Optional[int] = None,
+    max_examples: Optional[int] = None,
     group_size: int = 1,
 ) -> pd.DataFrame:
     """
@@ -103,18 +103,19 @@ def _extract_translation_rows(
     them into long documents.
 
     Args:
-        hf_split:   A HuggingFace dataset split (iterable).
-        src_lang:   Source language code (e.g., 'en').
-        tgt_lang:   Target language code (e.g., 'fr').
-        max_rows:   If set, truncate to this many DOCUMENT rows.
-        group_size: Number of consecutive sentences to concatenate into a document.
+        hf_split:     A HuggingFace dataset split.
+        src_lang:     Source language code (e.g., 'en').
+        tgt_lang:     Target language code (e.g., 'fr').
+        max_examples: If set, stop reading from the source after this many SENTENCES.
+        group_size:   Number of consecutive sentences to concatenate into a document.
     """
     sources, targets = [], []
-    
     current_src_group, current_tgt_group = [], []
     
+    examples_read = 0
+    
     for example in hf_split:
-        if max_rows is not None and len(sources) >= max_rows:
+        if max_examples is not None and examples_read >= max_examples:
             break
             
         translation: Dict[str, str] = example["translation"]
@@ -124,81 +125,24 @@ def _extract_translation_rows(
         if src_text and tgt_text:
             current_src_group.append(src_text)
             current_tgt_group.append(tgt_text)
+            examples_read += 1
             
             if len(current_src_group) == group_size:
                 sources.append(" ".join(current_src_group))
                 targets.append(" ".join(current_tgt_group))
                 current_src_group, current_tgt_group = [], []
 
-    # Handle remaining sentences if not perfectly divisible
-    if current_src_group and (max_rows is None or len(sources) < max_rows):
+    # Handle remaining sentences if any
+    if current_src_group:
         sources.append(" ".join(current_src_group))
         targets.append(" ".join(current_tgt_group))
 
     df = pd.DataFrame({"source": sources, "target": targets})
     logger.info(
-        "Extracted %d valid documents (Group Size: %d, src=%s, tgt=%s)", 
-        len(df), group_size, src_lang, tgt_lang
+        "Extracted %d documents from %d source sentences (Group Size: %d)", 
+        len(df), examples_read, group_size
     )
     return df
-
-
-def _extract_dochplt_rows(
-    hf_split,
-    max_rows: Optional[int] = None,
-    group_size: int = 50,
-) -> pd.DataFrame:
-    """
-    Extract perfectly aligned documents from HPLT/DocHPLT.
-    Parses 'alignment' metadata to ensure truncation doesn't break document parity.
-    """
-    sources, targets = [], []
-    
-    for example in hf_split:
-        if max_rows is not None and len(sources) >= max_rows:
-            break
-            
-        src_doc = example.get("src_doc", {})
-        tgt_doc = example.get("tgt_doc", {})
-        src_dict = dict(zip(src_doc.get("ids", []), src_doc.get("sentences", [])))
-        tgt_dict = dict(zip(tgt_doc.get("ids", []), tgt_doc.get("sentences", [])))
-        alignments = example.get("alignment", [])
-        
-        current_src_group, current_tgt_group = [], []
-        chunk_count = 0
-        
-        for align in alignments:
-            s_ids = align.get("src", [])
-            t_ids = align.get("tgt", [])
-            
-            s_sents = [src_dict.get(sid, "").strip() for sid in s_ids]
-            t_sents = [tgt_dict.get(tid, "").strip() for tid in t_ids]
-            
-            s_sent = " ".join(filter(None, s_sents))
-            t_sent = " ".join(filter(None, t_sents))
-            
-            if s_sent and t_sent:
-                    current_src_group.append(s_sent)
-                    current_tgt_group.append(t_sent)
-                    chunk_count += 1
-            
-            if chunk_count >= group_size:
-                sources.append(" ".join(current_src_group))
-                targets.append(" ".join(current_tgt_group))
-                current_src_group, current_tgt_group = [], []
-                chunk_count = 0
-                if max_rows is not None and len(sources) >= max_rows:
-                    break
-                    
-        # Add remainder if any
-        if current_src_group and (max_rows is None or len(sources) < max_rows):
-            sources.append(" ".join(current_src_group))
-            targets.append(" ".join(current_tgt_group))
-
-    df = pd.DataFrame({"source": sources, "target": targets})
-    logger.info("Extracted %d valid chunked documents from DocHPLT.", len(df))
-    return df
-
 
 
 def download_and_cache_dataset(
@@ -211,61 +155,24 @@ def download_and_cache_dataset(
     group_size: int = 30,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Download a dataset, concatenate sentences into documents, and cache as CSV.
-
-    Args:
-        data_dir:       Directory for storing/loading CSV files.
-        dataset_name:   HuggingFace dataset name (e.g. 'iwslt2017' or 'wmt14').
-        lang_pair:      Language pair string (e.g., 'en-fr').
-        max_train_rows: Cap on training document rows.
-        max_val_rows:   Cap on validation rows.
-        max_test_rows:  Cap on test rows.
-        group_size:     Number of sentences to concatenate into a single document.
+    Download/Stream a dataset, group sentences into docs, and cache.
     """
-    src_lang, tgt_lang = _parse_lang_pair(lang_pair)
-
     src_lang, tgt_lang = _parse_lang_pair(lang_pair)
 
     # --- Fast path: load from cache ---
     if _all_csvs_exist(data_dir, dataset_name, lang_pair):
         safe_ds = dataset_name.replace("/", "_")
-        logger.info(
-            "All CSV files found in '%s/%s/%s'. Loading from cache (skipping download).",
-            data_dir, safe_ds, lang_pair
-        )
+        logger.info( "Loading from cache: %s", data_dir)
         return {
             split: _load_dataframe(_csv_path(data_dir, dataset_name, lang_pair, split))
             for split in CSV_NAMES
         }
 
-    logger.info(
-        "CSV cache not found in '%s'. Downloading %s (%s)…", data_dir, dataset_name, lang_pair
-    )
-
-    if dataset_name == "HPLT/DocHPLT":
-        # DocHPLT natively only provides 'train' split.
-        tr_n = max_train_rows if max_train_rows is not None else 20000
-        v_n = max_val_rows if max_val_rows is not None else 1000
-        te_n = max_test_rows if max_test_rows is not None else 1000
-        total_needed = tr_n + v_n + te_n
-        
-        logger.info("Loading HPLT/DocHPLT via Streaming Mode to avoid 1TB+ download...")
-        try:
-            raw_datasets = load_dataset(dataset_name, f"{src_lang}-{tgt_lang}", split="train", streaming=True)
-            df_full = _extract_dochplt_rows(raw_datasets, max_rows=total_needed, group_size=group_size)
-        except Exception as e:
-            logger.error("Failed loading DocHPLT: %s", e)
-            raise e
-            
-        dataframes = {}
-        dataframes["train"] = df_full.iloc[:tr_n].copy()
-        dataframes["val"] = df_full.iloc[tr_n:tr_n+v_n].copy()
-        dataframes["test"] = df_full.iloc[tr_n+v_n:].copy()
-        
-        for k, v in dataframes.items():
-            _save_dataframe(v, _csv_path(data_dir, dataset_name, lang_pair, k))
-            
-        return dataframes
+    logger.info("Cache not found. Processing %s...", dataset_name)
+    
+    # Decide between streaming and full download
+    # We use streaming for WMT14 or large datasets if a limit is specified
+    use_streaming = (dataset_name == "wmt14") or (dataset_name == "HPLT/DocHPLT")
 
     if dataset_name == "iwslt2017":
         hf_subset = f"iwslt2017-{src_lang}-{tgt_lang}"
@@ -275,50 +182,53 @@ def download_and_cache_dataset(
         kwargs = {}
 
     try:
-        raw_datasets: DatasetDict = load_dataset(
-            dataset_name, hf_subset, **kwargs
-        )
-    except Exception:
+        raw_datasets = load_dataset(dataset_name, hf_subset, streaming=use_streaming, **kwargs)
+    except Exception as e:
+        # Fallback for reversed language pairs (e.g., fr-en instead of en-fr)
         if dataset_name == "iwslt2017":
             hf_subset_reversed = f"iwslt2017-{tgt_lang}-{src_lang}"
         else:
             hf_subset_reversed = f"{tgt_lang}-{src_lang}"
-            
-        logger.warning(
-            "Subset '%s' failed, retrying with '%s'.", hf_subset, hf_subset_reversed
-        )
-        raw_datasets = load_dataset(
-            dataset_name, hf_subset_reversed, **kwargs
-        )
+        
+        logger.warning("Subset '%s' failed, retrying with '%s'...", hf_subset, hf_subset_reversed)
+        raw_datasets = load_dataset(dataset_name, hf_subset_reversed, streaming=use_streaming, **kwargs)
 
-    max_rows_map = {
+    max_examples_map = {
         "train": max_train_rows,
         "val": max_val_rows,
         "test": max_test_rows,
     }
+    
+    dataframes: Dict[str, pd.DataFrame] = {}
+    
+    # Split names mapping
     hf_split_key_map = {
         "train": "train",
         "val": "validation",
         "test": "test",
     }
 
-    dataframes: Dict[str, pd.DataFrame] = {}
     for split_name, hf_key in hf_split_key_map.items():
-        if hf_key not in raw_datasets:
-            logger.warning("Split '%s' not found in WMT14 dataset; skipping.", hf_key)
+        # Handle cases where splits are missing in streaming DatasetDict
+        try:
+            split_data = raw_datasets[hf_key]
+        except KeyError:
+            logger.warning(f"Split {hf_key} not found in {dataset_name}. Skipping.")
             dataframes[split_name] = pd.DataFrame(columns=["source", "target"])
             continue
 
+        logger.info(f"Processing {split_name} split...")
         df = _extract_translation_rows(
-            raw_datasets[hf_key],
+            split_data,
             src_lang=src_lang,
             tgt_lang=tgt_lang,
-            max_rows=max_rows_map[split_name],
+            max_examples=max_examples_map[split_name],
             group_size=group_size,
         )
         _save_dataframe(df, _csv_path(data_dir, dataset_name, lang_pair, split_name))
         dataframes[split_name] = df
 
+    return dataframes
     return dataframes
 
 

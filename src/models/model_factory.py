@@ -14,10 +14,6 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, PreTrainedModel, BartForConditionalGeneration
 
-from .long_attention import LongAttention
-from .local_attention import LocalSlidingWindowAttention
-from .led_attention import LEDSelfAttention
-
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +44,11 @@ def inject_attention(
     if attention_type == "vanilla":
         logger.info("Using standard BART attention — no injection performed.")
         return
+
+    # Lazy imports to break circular dependency
+    from .long_attention import LongAttention
+    from .local_attention import LocalSlidingWindowAttention
+    from .led_attention import LEDSelfAttention
 
     try:
         layers = model.model.encoder.layers
@@ -127,7 +128,6 @@ def build_model(
     logger.info("Loading backbone model: %s (dtype=%s)", backbone, torch_dtype)
     model: PreTrainedModel = BartForConditionalGeneration.from_pretrained(
         backbone,
-        dtype=torch_dtype,
         device_map=device_map,
     )
 
