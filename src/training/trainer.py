@@ -21,6 +21,7 @@ beam search / greedy decoding at inference time.
 """
 
 import logging
+import time
 from argparse import Namespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -39,6 +40,7 @@ from transformers import (
 from torch.utils.data import Dataset
 
 from ..utils.io_utils import save_metrics, save_model_artifacts
+from .metrics import make_compute_metrics, estimate_model_gflops
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +235,55 @@ class LongAttentionTrainer(Seq2SeqTrainer):
         self.diversity_weight = diversity_weight
         self.null_weight = null_weight
 
+    def evaluate(
+        self,
+        eval_dataset: Optional[Dataset] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """
+        Run evaluation and collect profiling metrics (Latency, Memory, GFLOPS).
+        """
+        # Reset peak memory tracker
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            
+        start_time = time.time()
+        
+        # Run standard evaluation
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset, 
+            ignore_keys=ignore_keys, 
+            metric_key_prefix=metric_key_prefix
+        )
+        
+        duration = time.time() - start_time
+        num_samples = len(eval_dataset) if eval_dataset is not None else 1
+        
+        # 1. Latency (ms per sample)
+        metrics[f"{metric_key_prefix}_latency_ms"] = (duration / num_samples) * 1000
+        
+        # 2. Peak Memory (MB)
+        if torch.cuda.is_available():
+            peak_mem = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            metrics[f"{metric_key_prefix}_peak_memory_mb"] = peak_mem
+            
+        # 3. Estimated GFLOPS (Inference)
+        # We assume max_length from trainer config or model
+        seq_len = getattr(self.args, "max_source_length", 1024)
+        attn_type = getattr(self.args, "attention_type", "standard")
+        
+        gflops = estimate_model_gflops(
+            model=self.model,
+            seq_len=seq_len,
+            batch_size=1, # Report per-sample GFLOPS
+            attention_type=attn_type,
+            window_size=512 # Default window size
+        )
+        metrics[f"{metric_key_prefix}_estimated_gflops"] = gflops
+        
+        return metrics
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
         Compute standard Seq2Seq loss + LongAttention research losses.
@@ -347,6 +398,8 @@ def run_training(
         logger.info("Configuring for Self Pre-training (SPT)...")
         collator = BARTDenoisingCollator(tokenizer)
         training_args.predict_with_generate = False # Don't evaluate with BLEU during SPT
+        training_args.metric_for_best_model = "eval_loss" # Use loss for SPT
+        training_args.greater_is_better = False
         compute_metrics = None
     else:
         collator = DataCollatorForSeq2Seq(tokenizer, model=model)
