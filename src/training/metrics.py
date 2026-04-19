@@ -327,3 +327,33 @@ def make_compute_metrics(
         return results
 
     return compute_metrics
+
+
+def estimate_model_gflops(
+    model: torch.nn.Module,
+    seq_len: int,
+    batch_size: int = 1,
+    attention_type: str = "standard",
+    window_size: int = 512,
+) -> float:
+    """
+    Manually estimate the GFLOPS for a single forward pass of the model.
+    This provides a consistent metric for papers without needing extra libs.
+    """
+    # 1. Base flops from parameters (Non-attention)
+    total_params = sum(p.numel() for p in model.parameters())
+    base_flops = 2 * total_params * seq_len * batch_size
+
+    # 2. Attention overhead (Simplified)
+    d_model = 768
+    num_heads = 12
+    d_k = d_model // num_heads
+    num_layers = 12 # 6 Enc + 6 Dec
+    
+    if attention_type in ["long_attention", "led"]:
+        attn_flops = 4 * batch_size * num_layers * seq_len * window_size * d_k
+    else:
+        attn_flops = 4 * batch_size * num_layers * seq_len * seq_len * d_k
+
+    total_flops = base_flops + attn_flops
+    return total_flops / 1e9 # Convert to GFLOPS
