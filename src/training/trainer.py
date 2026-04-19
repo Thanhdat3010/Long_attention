@@ -86,7 +86,7 @@ class Seq2SeqDocumentDataset(Dataset):
         dataframe,
         tokenizer: PreTrainedTokenizerBase,
         src_max_len: int = 1024,
-        tgt_max_len: int = 256,
+        tgt_max_len: int = 1024,
         src_lang_name: str = "English",
         tgt_lang_name: str = "French",
     ) -> None:
@@ -109,6 +109,7 @@ class Seq2SeqDocumentDataset(Dataset):
             src_text,
             max_length=self.src_max_len,
             truncation=True,
+            padding="max_length",
         )
 
         # Tokenise target for decoder labels
@@ -116,6 +117,7 @@ class Seq2SeqDocumentDataset(Dataset):
             text_target=tgt_text,
             max_length=self.tgt_max_len,
             truncation=True,
+            padding="max_length",
         )
 
         return {
@@ -162,7 +164,18 @@ class BARTDenoisingCollator:
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # Handle pre-tokenized inputs: Pad them to the same length in the batch
         if "input_ids" in examples[0]:
-            batch = self.tokenizer.pad(examples, return_tensors="pt")
+            # For SPT denoising, we reconstruct labels from input_ids. 
+            # We strip existing 'labels' to avoid padding conflicts if they have different lengths.
+            features = [
+                {"input_ids": ex["input_ids"], "attention_mask": ex["attention_mask"]} 
+                for ex in examples
+            ]
+            batch = self.tokenizer.pad(
+                features, 
+                return_tensors="pt", 
+                padding="max_length", 
+                max_length=self.tokenizer.model_max_length
+            )
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
         else:
