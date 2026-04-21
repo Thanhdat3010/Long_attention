@@ -1,44 +1,31 @@
-# LongAttention: Gated Functional Information Compression for Scalable Context Understanding
+# LongAttention: Necessity-Aware, Dependency-Typed Attention for Long-Context Modeling (v2)
 
-A complete, modular research codebase for evaluating the **LongAttention** attention mechanism against standard Qwen2 baselines on Neural Machine Translation (WMT14).
+A modular research codebase for evaluating the **LongAttention v2** mechanism—featuring necessity-aware gating and dependency-typed retrieval—against **LED (Longformer-Encoder-Decoder)** and **BART** baselines on document-level translation tasks (WMT14).
 
 ---
 
 ## 📁 Project Structure
 
-```
+```bash
 Long_attention/
-├── config/
-│   └── default_config.yaml        # Reference for all hyperparameters
-├── data/                          # Auto-populated with WMT14 CSV files
-│   ├── train.csv
-│   ├── val.csv
-│   └── test.csv
-├── outputs/                       # Model checkpoints and metrics (auto-generated)
-│   └── {model_name}/
-│       └── {attention_type}_lr{lr}_bs{bs}/
-│           ├── pytorch_model.safetensors
-│           ├── tokenizer files
-│           ├── metrics.json
-│           ├── args.json
-│           ├── attention_sink_log.json
-│           └── gate_entropy_log.json
 ├── scripts/
-│   ├── run_experiment.py          # ← Main entry point
-│   └── evaluate.py                # ← Standalone evaluation
-└── src/
-    ├── data/
-    │   └── data_preparation.py    # WMT14 download + CSV caching
-    ├── models/
-    │   ├── long_attention.py      # Core LongAttention nn.Module
-    │   ├── local_attention.py     # Sliding-window local branch
-    │   └── model_factory.py       # Backbone loading + injection logic
-    ├── training/
-    │   ├── trainer.py             # Seq2SeqTrainer wrapper
-    │   ├── metrics.py             # BLEU / ChrF++ / COMET / Sink Ratio
-    │   └── callbacks.py           # AttentionSink + GateDiversity hooks
-    └── utils/
-        └── io_utils.py            # Output dir management, metrics saving
+│   ├── run_experiment.py          # ← Main entry point (Two-stage: SPT + Fine-tuning)
+│   ├── evaluate.py                # ← Standalone evaluation
+│   └── prepare_data.py            # ← Manual data pre-processing script
+├── src/
+│   ├── models/
+│   │   ├── long_attention.py      # Gated & Typed Long-range branch
+│   │   ├── local_attention.py     # Bidirectional sliding-window local branch
+│   │   ├── led_attention.py       # Official LED (Dedicated Global QKV) baseline
+│   │   └── model_factory.py       # Backbone loading + Weight Inheritance logic
+│   ├── training/
+│   │   ├── trainer.py             # Seq2SeqTrainer + Research Loss computation
+│   │   ├── metrics.py             # BLEU / ChrF++ / COMET
+│   │   └── callbacks.py           # Logging hooks
+│   └── data/
+│       └── data_preparation.py    # Document-level concatenation & caching
+├── data/                          # Auto-populated with cached WMT14 documents
+└── outputs/                       # Experiment logs and checkpoints
 ```
 
 ---
@@ -50,120 +37,92 @@ Long_attention/
 git clone <your-repo-url>
 cd Long_attention
 
-# 2. Create and activate a virtual environment (recommended)
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux/Mac:
-source .venv/bin/activate
-
-# 3. Install dependencies
+# 2. Install dependencies
 pip install -r requirements.txt
 ```
 
-> **GPU requirement:** A CUDA-capable GPU with at least 16 GB VRAM is recommended for Qwen2-1.5B, and ≥40 GB for Qwen2-7B.
+> **Hardware Note:** Optimized for A100/H100 GPUs using `bfloat16`. 
 
 ---
 
 ## 🚀 Quick Start
 
-### Run Standard Baseline (Qwen2-1.5B)
+The pipeline supports **Two-Stage Training**:
+1. **Stage 1 (SPT):** Self-Pre-training via Text Infilling (MLM) to stabilize the new attention gates.
+2. **Stage 2 (Fine-tuning):** Document-level translation on WMT14.
+
+### 1. Run LongAttention Experiment (v2)
+This command performs both SPT and Fine-tuning with **Weight Inheritance** from pre-trained BART.
 
 ```bash
 python scripts/run_experiment.py \
-    --backbone Qwen/Qwen2-1.5B \
-    --attention_type standard \
-    --lang_pair en-fr \
-    --epochs 3 \
-    --batch_size 4 \
-    --learning_rate 2e-5
-```
-
-### Run LongAttention Experiment (Qwen2-1.5B)
-
-```bash
-python scripts/run_experiment.py \
-    --backbone Qwen/Qwen2-1.5B \
     --attention_type long_attention \
+    --dataset wmt14 \
     --lang_pair en-fr \
+    --max_train_samples 1000000 \
+    --group_size 50 \
+    --run_spt \
+    --spt_epochs 3 \
     --epochs 3 \
-    --batch_size 4 \
+    --batch_size 2 \
     --learning_rate 2e-5 \
-    --local_window_size 512 \
-    --top_k 64
-```
-
-### Scale to 7B
-
-```bash
-python scripts/run_experiment.py \
-    --backbone Qwen/Qwen2-7B \
-    --attention_type long_attention \
-    --batch_size 2 \
-    --learning_rate 1e-5 \
+    --diversity_weight 0.1 \
+    --null_weight 0.01 \
     --dtype bfloat16 \
-    --max_train_samples 500000
+    --output_dir ./outputs/long_attention_v2
 ```
 
-### Evaluate a Saved Checkpoint
-
-```bash
-python scripts/evaluate.py \
-    --checkpoint_dir outputs/qwen2-1.5b/long_attention_lr2e-5_bs4 \
-    --lang_pair en-fr \
-    --split test \
-    --compute_sink_ratio \
-    --batch_size 8
-```
-
-### Quick Smoke Test (Minimal Data)
+### 2. Run LED Baseline (Official Architecture)
+Uses dedicated global projections for the `<s>` token, inheriting weights from BART.
 
 ```bash
 python scripts/run_experiment.py \
-    --attention_type long_attention \
-    --max_train_samples 512 \
-    --max_val_samples 128 \
-    --epochs 1 \
+    --attention_type led \
+    --dataset wmt14 \
+    --lang_pair en-fr \
+    --run_spt \
+    --spt_epochs 3 \
+    --epochs 3 \
     --batch_size 2 \
-    --no_comet
+    --learning_rate 2e-5 \
+    --dtype bfloat16 \
+    --output_dir ./outputs/led_baseline
 ```
 
 ---
 
-## 🧠 Architecture Overview
+## 🧠 Architecture: LongAttention v2
 
-### LongAttention (Gated Functional Information Compression)
+LongAttention is designed to be **necessity-aware** (deciding *if* to look far) and **dependency-typed** (deciding *why* to look far).
 
+### The Multi-Branch Operator
 ```
-Input Hidden States S  (B, T, D)
-         │
-         ├─────────────────────────────────────────────┐
-         │                                             │
-   ┌─────▼────────────────────────────────────┐  ┌────▼──────────────────────────────┐
-   │   LOCAL BRANCH (Branch 1)                 │  │   GATED FUNCTIONAL COMPRESSION    │
-   │   LocalSlidingWindowAttention             │  │   BRANCH (Branch 2)               │
-   │   Dense causal attention, window W        │  │                                   │
-   │   Captures syntax & co-reference          │  │  1. FunctionalDecomposer          │
-   │                                           │  │     S → R (Semantic Root)         │
-   │   A_local = softmax(QK^T/√d)[N_i] · V    │  │       + A (Functional Affix)      │
-   └─────────────────────┬─────────────────────┘  │                                   │
-                         │                         │  2. Gating: G = σ(X W_θ)         │
-                         │                         │  3. GistReservoir                 │
-                         │                         │     K_gist, V_gist =              │
-                         │                         │     (G⊙f_θ(R)) + Codebook(A)     │
-                         │                         │                                   │
-                         │                         │  4. BiDirectional Top-K           │
-                         │                         │     A_long = Σ_{TopK} Corr·V     │
-                         │                         └──────────────────┬────────────────┘
-                         │                                            │
-                         └──────────────┬─────────────────────────────┘
-                                        │
-                                 ┌──────▼──────────────────────────────────┐
-                                 │   OUTPUT INTEGRATION                     │
-                                 │   α = sigmoid(W_α · S)                   │
-                                 │   O = LayerNorm(A_local + α · A_long)    │
-                                 └─────────────────────────────────────────┘
+Query Token q_i
+     │
+     ├─────────────────────────────────────────────┐
+     │                                             │
+┌────▼──────────────────────────┐      ┌───────────▼────────────────────────────┐
+│ LOCAL BRANCH                  │      │ LONG-RANGE BRANCH (Necessity/Typed)    │
+│ Sliding Window (Symmetric)    │      │                                        │
+│ Window Size W = 512           │      │ 1. Necessity Gate g_i ∈ [0, 1]         │
+│                               │      │ 2. Dependency Typed Gists (K_t, V_t)    │
+│ A_local = Attn(q, K_win, V_win)│      │ 3. Typed Top-K Retrieval               │
+└────────────────┬──────────────┘      │    - Coreference / Lexical / Discourse │
+                 │                     │    - O_long = Σ_t w_t * Attn_t(q, K, V)│
+                 │                     └───────────┬────────────────────────────┘
+                 │                                 │
+                 └──────────────┬──────────────────┘
+                                │
+                  ┌─────────────▼───────────────┐
+                  │ FINAL PROJECTION            │
+                  │ O = OutProj(Local + g_i*Long)│
+                  └─────────────────────────────┘
 ```
+
+### Key Principles
+- **Weight Inheritance:** Newly injected layers (Local, Typed) are initialized by copying pre-trained BART weights to ensure a warm start.
+- **Null-Route Calibration:** A sparsity penalty (`null_weight`) encourages the gate to stay closed when local context is sufficient.
+- **Diversity Regularization:** A cosine similarity penalty (`diversity_weight`) forces dependency types to specialize in different context patterns.
 
 ---
 
@@ -171,65 +130,26 @@ Input Hidden States S  (B, T, D)
 
 | Metric | Description |
 |---|---|
-| **SacreBLEU** | Standardised corpus BLEU (0–100) |
-| **ChrF++** | Character n-gram F-score with word order (0–100) |
-| **COMET** | Neural DA metric via `Unbabel/wmt22-comet-da` (≈0–1) |
-| **Attention Sink Ratio** | % of attention on token 0 (target: <5%) |
-| **Root Fidelity Score** | % of semantic roots retained post-compression (new) |
-| **Gate Entropy** | Diversity of the functional decomposer gate scores |
+| **SacreBLEU** | Corpus-level translation quality. |
+| **COMET** | Neural semantic embedding similarity (Unbabel/wmt22-comet-da). |
+| **Gate Activity** | % of tokens activating the long-range branch. |
+| **Type Diversity** | Measure of how distinct the dependency types are. |
 
 ---
 
-## 🔧 Full Argument Reference
+## 🔧 Argument Reference (Key Flags)
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data_dir` | `./data` | Directory for WMT14 CSVs |
-| `--lang_pair` | `en-fr` | Language pair (e.g., `en-fr`, `de-en`) |
-| `--backbone` | `Qwen/Qwen2-1.5B` | HuggingFace model ID |
-| `--attention_type` | `standard` | `standard` or `long_attention` |
-| `--batch_size` | `4` | Per-device batch size |
-| `--learning_rate` | `2e-5` | Peak LR for AdamW |
-| `--epochs` | `3` | Training epochs |
-| `--max_source_length` | `256` | Max source prompt tokens |
-| `--max_target_length` | `256` | Max target tokens |
-| `--local_window_size` | `512` | Local branch window size |
-| `--top_k` | `64` | Top-K positions for long-range retrieval |
-| `--bottleneck_ratio` | `0.25` | Gate head bottleneck ratio |
-| `--dropout_prob` | `0.0` | Attention dropout |
-| `--freeze_backbone` | `False` | Freeze backbone, train only LongAttention |
-| `--output_dir` | `./outputs` | Base output directory |
-| `--no_comet` | `False` | Skip COMET computation |
-| `--dtype` | `float16` | Weight precision |
-| `--seed` | `42` | Random seed |
+| `--attention_type` | `vanilla` | `vanilla`, `led`, or `long_attention`. |
+| `--run_spt` | `False` | Enables Stage 1 (Text Infilling). |
+| `--spt_epochs` | `1` | Duration of Stage 1. |
+| `--group_size` | `50` | Sentence count for document-level concatenation. |
+| `--null_weight` | `0.01` | Penalty for opening the long-range gate. |
+| `--diversity_weight` | `0.1` | Penalty for overlap between dependency types. |
+| `--top_k` | `64` | Num of segments retrieved in the long-range branch. |
 
 ---
 
-## 📂 Output Directory Format
-
-```
-outputs/
-└── qwen2-1.5b/
-    ├── standard_lr2e-5_bs4/
-    │   ├── metrics.json
-    │   ├── args.json
-    │   └── attention_sink_log.json
-    └── long_attention_lr2e-5_bs4/
-        ├── metrics.json
-        ├── args.json
-        ├── attention_sink_log.json
-        └── gate_entropy_log.json
-```
-
----
-
-## 📜 Reference
-
-This codebase implements the **LongAttention** proposal:
-> *LongAttention: Gated Functional Information Compression for Scalable Context Understanding*
-
-Key references:
-- Qwen2 Technical Report (Qwen Team, 2024)
-- FlashAttention-2 (Dao et al., 2023)
-- RULER Benchmark (Hsieh et al., 2024)
-- WMT14 En-Fr Translation Benchmark
+## 📜 Acknowledgements
+This codebase is built upon **HuggingFace Transformers** and uses **facebook/bart-base** as the default backbone. Special credit to the **Longformer (LED)** paper for the sliding window baseline.
