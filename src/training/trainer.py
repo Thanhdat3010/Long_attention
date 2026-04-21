@@ -22,6 +22,8 @@ beam search / greedy decoding at inference time.
 
 import logging
 import time
+import transformers
+from packaging import version
 from argparse import Namespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -70,6 +72,45 @@ class GPUMemoryCallback(TrainerCallback):
             )
 
 
+import sys
+
+from tqdm.auto import tqdm
+
+class SmoothProgressCallback(TrainerCallback):
+    """
+    A custom TQDM progress bar that replaces the default HuggingFace one.
+    It guarantees real-time updates for loss, gate, and diversity without JSON spam.
+    """
+    def __init__(self):
+        self.pbar = None
+        self.trainer = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        is_spt = getattr(args, "metric_for_best_model", "") == "eval_loss"
+        stage_name = "Stage 1 (SPT)" if is_spt else "Stage 2 (Fine-Tuning)"
+        
+        self.pbar = tqdm(total=state.max_steps, desc=stage_name, dynamic_ncols=True, leave=True)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.pbar is not None:
+            self.pbar.update(1)
+            trainer = self.trainer
+            if trainer and hasattr(trainer, "latest_loss"):
+                loss = trainer.latest_loss
+                gate = getattr(trainer, "latest_gate_val", 0.0)
+                div = getattr(trainer, "latest_diversity_loss", 0.0)
+                
+                postfix = {"loss": f"{loss:.4f}"}
+                if gate > 0 or div > 0:
+                    postfix["gate"] = f"{gate:.3f}"
+                    postfix["div"] = f"{div:.3f}"
+                
+                self.pbar.set_postfix(postfix)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.pbar is not None:
+            self.pbar.close()
+            self.pbar = None
 
 # ---------------------------------------------------------------------------
 # Native Seq2Seq Dataset for Encoder-Decoder Models (e.g., BART)
@@ -172,11 +213,13 @@ class BARTDenoisingCollator:
                 {"input_ids": ex["input_ids"], "attention_mask": ex["attention_mask"]} 
                 for ex in examples
             ]
+            # Hardcode max_length to 1024 to prevent OverflowError in some environments
+            # where model_max_length defaults to a huge number.
             batch = self.tokenizer.pad(
                 features, 
                 return_tensors="pt", 
                 padding="max_length", 
-                max_length=self.tokenizer.model_max_length
+                max_length=1024
             )
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
@@ -234,6 +277,17 @@ class LongAttentionTrainer(Seq2SeqTrainer):
         super().__init__(*args, **kwargs)
         self.diversity_weight = diversity_weight
         self.null_weight = null_weight
+        self.latest_loss = 0.0 # Store loss for real-time display
+        self.latest_gate_val = 0.0 
+        self.latest_diversity_loss = 0.0
+
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        """Override log to inject custom metrics into the progress bar and training logs."""
+        if hasattr(self, "latest_gate_val") and self.latest_gate_val > 0.0:
+            logs["gate"] = round(self.latest_gate_val, 4)
+        if hasattr(self, "latest_diversity_loss") and self.latest_diversity_loss > 0.0:
+            logs["div"] = round(self.latest_diversity_loss, 4)
+        super().log(logs, *args, **kwargs)
 
     def evaluate(
         self,
@@ -314,13 +368,26 @@ class LongAttentionTrainer(Seq2SeqTrainer):
             # 1. Diversity Loss: Encourage types to stay separate
             loss += self.diversity_weight * diversity_loss
             
-            # 2. Null-Route Calibration: Penalize large gate values (encourage sparsity)
-            # This is the "Reward for not opening routes"
-            loss += self.null_weight * gate_val
+            # 2. Null-Route Calibration (With Dynamic Epoch-based Warmup)
+            # Dần dần áp dụng hình phạt trong 0.5 Epoch đầu tiên để tránh chết Cổng sớm
+            current_epoch = self.state.epoch if self.state.epoch is not None else 0.0
+            warmup_epochs = 0.5 
+            
+            if current_epoch < warmup_epochs:
+                warmup_factor = current_epoch / warmup_epochs
+            else:
+                warmup_factor = 1.0
+                
+            effective_null_weight = self.null_weight * warmup_factor
+            loss += effective_null_weight * gate_val
+            
+            self.latest_gate_val = gate_val.item()
+            self.latest_diversity_loss = diversity_loss.item()
             
             if self.state.global_step % 50 == 0:
                 logger.debug(f"Step {self.state.global_step} | DivLoss: {diversity_loss:.4f} | GateVal: {gate_val:.4f}")
 
+        self.latest_loss = loss.item() if isinstance(loss, torch.Tensor) else loss
         return (loss, outputs) if return_outputs else loss
 
 
@@ -336,33 +403,42 @@ def build_training_args(
     """
     Construct HuggingFace Seq2SeqTrainingArguments from argparse Namespace.
     """
-    return Seq2SeqTrainingArguments(
-        output_dir=output_dir,
-        overwrite_output_dir=True,
-        do_train=True,
-        do_eval=True,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        logging_strategy="epoch",
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        weight_decay=0.01,
-        num_train_epochs=args.epochs,
-        lr_scheduler_type="linear",
-        warmup_ratio=0.1,
-        predict_with_generate=True, # Critical for BLEU evaluation
-        generation_max_length=args.max_target_length,
-        fp16=(args.dtype == "float16"),
-        bf16=(args.dtype == "bfloat16"),
-        seed=args.seed,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_sacrebleu",
-        greater_is_better=True,
-        report_to="tensorboard",
-        disable_tqdm=False, # Ensure progress bars are visible
-    )
+    # Build kwargs dynamically for version compatibility
+    training_kwargs = {
+        "output_dir": output_dir,
+        "do_train": True,
+        "do_eval": True,
+        "logging_strategy": "epoch",  # Revert to epoch to avoid JSON spam
+        "save_strategy": "epoch",
+        "predict_with_generate": True,
+        "generation_max_length": 1024, # Force sequence generation up to 1024 to prevent BLEU 0
+        "generation_num_beams": 4,     # Use beam search for higher translation quality
+        "per_device_train_batch_size": args.batch_size,
+        "per_device_eval_batch_size": args.batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "weight_decay": 0.01,
+        "num_train_epochs": args.epochs,
+        "lr_scheduler_type": "linear",
+        "warmup_steps": 100,
+        "fp16": (args.dtype == "float16"),
+        "bf16": (args.dtype == "bfloat16"),
+        "seed": args.seed,
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_sacrebleu",
+        "greater_is_better": True,
+        "report_to": "tensorboard",
+        "disable_tqdm": True, # Disable default TQDM to let our custom bar run smoothly
+    }
+
+    # Handle evaluation_strategy vs eval_strategy
+    v_info = version.parse(transformers.__version__)
+    if v_info >= version.parse("4.41.0"):
+        training_kwargs["eval_strategy"] = "epoch"
+    else:
+        training_kwargs["evaluation_strategy"] = "epoch"
+
+    return Seq2SeqTrainingArguments(**training_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -411,11 +487,13 @@ def run_training(
         )
 
     # Callbacks
+    progress_callback = SmoothProgressCallback()
     callbacks = [
         AttentionSinkCallback(output_dir=output_dir, log_to_file=True),
         GPUMemoryCallback(),
         CheckpointMetadataCallback(metadata=vars(args)),
         EarlyStoppingCallback(early_stopping_patience=3),
+        progress_callback,
     ]
     if args.attention_type == "long_attention":
         callbacks.append(GateDiversityCallback(output_dir=output_dir, log_to_file=True))
@@ -432,6 +510,9 @@ def run_training(
         diversity_weight=getattr(args, "diversity_weight", 0.1),
         null_weight=getattr(args, "null_weight", 0.01),
     )
+    
+    # Assign trainer reference to custom progress callback for real-time loss tracking
+    progress_callback.trainer = trainer
 
     # ------ Train ------
     logger.info("Starting %s training...", "SPT" if is_spt else "Fine-tuning")

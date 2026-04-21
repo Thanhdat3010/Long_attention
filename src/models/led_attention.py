@@ -2,12 +2,17 @@
 LED Attention: Sliding Window with Global Tokens.
 A BART-compatible implementation of Longformer-style attention for LED experiments.
 """
-
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+
+import transformers
+from packaging import version
+
+# Transformers >= 4.36 changed BartEncoderLayer signature from 3-tuple to 2-tuple return expectation
+TRANSFORMERS_NEW_SIG = version.parse(transformers.__version__) >= version.parse("4.36.0")
 
 class LEDSelfAttention(nn.Module):
     """
@@ -29,11 +34,17 @@ class LEDSelfAttention(nn.Module):
         self.window_size = window_size
         self.scale = math.sqrt(self.head_dim)
 
+        # Local Projections
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
+        
+        # Global Projections (Official LED Component)
+        self.q_proj_global = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.k_proj_global = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.v_proj_global = nn.Linear(hidden_size, hidden_size, bias=bias)
 
+        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.attn_dropout = nn.Dropout(p=dropout_prob)
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
@@ -57,32 +68,45 @@ class LEDSelfAttention(nn.Module):
         B, T, D = hidden_states.shape
         device = hidden_states.device
         
-        Q = self._split_heads(self.q_proj(hidden_states))
-        K = self._split_heads(self.k_proj(hidden_states))
-        V = self._split_heads(self.v_proj(hidden_states))
+        # Default global mask if not provided (BART sets None by default)
+        if global_attention_mask is None:
+            global_attention_mask = torch.zeros(B, T, device=device, dtype=torch.bool)
+            global_attention_mask[:, 0] = True # <s> is global token
+        else:
+            global_attention_mask = global_attention_mask.bool()
+
+        # 1. Compute Local and Global Projections
+        Q_local = self.q_proj(hidden_states)
+        K_local = self.k_proj(hidden_states)
+        V_local = self.v_proj(hidden_states)
+        
+        Q_global = self.q_proj_global(hidden_states)
+        K_global = self.k_proj_global(hidden_states)
+        V_global = self.v_proj_global(hidden_states)
+        
+        # 2. Select representations based on global_attention_mask
+        mask_expanded = global_attention_mask.unsqueeze(-1) # (B, T, 1)
+        
+        # If token is global, use global projections, else local
+        Q = torch.where(mask_expanded, Q_global, Q_local)
+        K = torch.where(mask_expanded, K_global, K_local)
+        V = torch.where(mask_expanded, V_global, V_local)
+        
+        Q = self._split_heads(Q) # (B, H, T, d_k)
+        K = self._split_heads(K)
+        V = self._split_heads(V)
 
         # Standard Attention Scores
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale # (B, H, T, T)
 
-        # 1. Sliding Window Mask
-        # We manually build the mask for simplicity in this baseline
+        # 3. Sliding Window Mask (Symmetric for Encoder)
         idx = torch.arange(T, device=device)
         row = idx.unsqueeze(1)
         col = idx.unsqueeze(0)
-        # causal window: j <= i AND i - j < W
-        # LED usually uses a symmetric window in encoder, but BART can be causal.
-        # Proposal says "Sliding window of LED", which is usually symmetric in encoder.
-        mask_window = (row - col).abs() < (self.window_size // 2)
-        
-        # 2. Global Attention Mask
-        # If global_attention_mask is not provided, we default to the first token (BOS)
-        if global_attention_mask is None:
-            global_attention_mask = torch.zeros(B, T, device=device)
-            global_attention_mask[:, 0] = 1 # <s> is global
+        mask_window = (row - col).abs() <= (self.window_size // 2)
             
         # Global tokens can see everything, and everything can see global tokens
-        # mask = window_mask OR (row is global) OR (col is global)
-        is_global = global_attention_mask.bool() # (B, T)
+        is_global = global_attention_mask # (B, T)
         
         # Expand masks to (B, 1, T, T)
         final_mask = mask_window.unsqueeze(0).unsqueeze(0).repeat(B, 1, 1, 1) # (B, 1, T, T)
@@ -106,4 +130,8 @@ class LEDSelfAttention(nn.Module):
 
         # BART expects a 3-tuple: (output, attn_weights, past_key_value)
         output_attentions = kwargs.get("output_attentions", False)
-        return (output, attn_weights if output_attentions else None, None)
+        # Multi-version compatibility (RTX 6000 vs A100)
+        if TRANSFORMERS_NEW_SIG:
+            return (output, attn_weights if output_attentions else None)
+        else:
+            return (output, attn_weights if output_attentions else None, None)

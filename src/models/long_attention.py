@@ -26,7 +26,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import transformers
+from packaging import version
+
 logger = logging.getLogger(__name__)
+
+# Transformers >= 4.36 changed BartEncoderLayer signature from 3-tuple to 2-tuple return expectation
+TRANSFORMERS_NEW_SIG = version.parse(transformers.__version__) >= version.parse("4.36.0")
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +114,7 @@ class DependencyTypedGist(nn.Module):
         self.num_types = num_types
         # Each type has its own semantic projection
         self.type_projs = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size * 2, bias=False) 
+            nn.Linear(hidden_size, hidden_size * 2, bias=True) 
             for _ in range(num_types)
         ])
         
@@ -154,7 +160,7 @@ class TypedTopKRetrieval(nn.Module):
 
         # Query projections: one per type to allow type-specific relevance
         self.q_projs = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size, bias=False)
+            nn.Linear(hidden_size, hidden_size, bias=True)
             for _ in range(num_types)
         ])
         
@@ -167,6 +173,7 @@ class TypedTopKRetrieval(nn.Module):
         hidden_states: torch.Tensor,
         K_typed: torch.Tensor,
         V_typed: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -194,6 +201,11 @@ class TypedTopKRetrieval(nn.Module):
             # Scores: (B, H, T, T)
             scores = torch.matmul(Q_t, K_t.transpose(-2, -1)) / self.scale
             
+            # Apply padding mask (e.g., -inf on <PAD> tokens)
+            if attention_mask is not None:
+                # attention_mask is usually (B, 1, T, T) or (B, 1, 1, T) provided by HF
+                scores = scores + attention_mask
+
             # Top-K
             if effective_k < T:
                 topk_values, _ = torch.topk(scores, k=effective_k, dim=-1)
@@ -278,7 +290,8 @@ class LongAttention(nn.Module):
             dropout_prob=dropout_prob
         )
 
-        self.output_norm = nn.LayerNorm(hidden_size)
+        # Final output projection (to be initialized with BART's pretrained weights)
+        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         
         # Track metric for research analysis
         self.last_gate_val = 0.0
@@ -296,13 +309,17 @@ class LongAttention(nn.Module):
     ) -> Tuple[torch.Tensor, ...]:
         
         # ── Local Branch ──
-        A_local, local_attn_weights, _ = self.local_attention(
+        local_outputs = self.local_attention(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
         )
+        if TRANSFORMERS_NEW_SIG:
+            A_local, local_attn_weights = local_outputs
+        else:
+            A_local, local_attn_weights, _ = local_outputs
 
         # ── Long-range Branch ──
         # 1. Necessity Gate g_i
@@ -311,26 +328,44 @@ class LongAttention(nn.Module):
 
         # 2. Decompose Gist
         global_ctx = hidden_states.mean(dim=1, keepdim=True)
-        R_encoded, A_encoded, _ = self.decomposer(hidden_states, global_ctx)
+        decomp_outputs = self.decomposer(hidden_states, global_ctx)
+        
+        # Internal modules like Decomposer should return consistent 3-tuples or we handle versioning
+        # FunctionalDecomposer.forward returns 3 values currently, let's keep it safe.
+        R_encoded, A_encoded, _ = decomp_outputs
         
         # 3. Build Typed Gists (K_t, V_t)
         K_typed, V_typed = self.typed_gist(R_encoded + A_encoded)
         
         # 4. Typed Retrieval
-        A_long, diversity_loss = self.typed_retrieval(hidden_states, K_typed, V_typed)
+        A_long, diversity_loss = self.typed_retrieval(
+            hidden_states=hidden_states, 
+            K_typed=K_typed, 
+            V_typed=V_typed, 
+            attention_mask=attention_mask
+        )
         self.last_diversity_loss = diversity_loss # Keep as tensor for backprop
         
         # ── Output Integration ──
-        # A_i = A_i^local + g_i * A_i^long
-        output = self.output_norm(A_local + g_i * A_long)
-
+        # Formula: O = OutProj( LocalContext + g_i * LongContext )
+        # This perfectly matches standard Transformer output projection logic.
+        combined_context = A_local + g_i * A_long
+        output = self.out_proj(combined_context)
+        
+        # Track metric for research analysis / Trainer logging
+        self.last_gate_val = g_i.mean() 
+        self.last_diversity_loss = diversity_loss 
+        
         # Hook for trainer to collect losses (used in metrics and callbacks)
+        # We attach these as attributes to the output tensor so the trainer can find them
         if self.training:
             output.diversity_loss = diversity_loss
             output.gate_val = g_i.mean()
-
-        # BART expects a 3-tuple: (output, attn_weights, past_key_value)
-        return (output, local_attn_weights if output_attentions else None, past_key_value)
+            
+        if TRANSFORMERS_NEW_SIG:
+            return (output, local_attn_weights if output_attentions else None)
+        else:
+            return (output, local_attn_weights if output_attentions else None, past_key_value)
 
     def extra_repr(self) -> str:
         return (

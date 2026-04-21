@@ -106,6 +106,63 @@ def inject_attention(
 
         # Hot-swap
         layer.self_attn = new_attn
+        
+        # 4. Weight Inheritance: Copy pre-trained BART weights to new modules
+        # This keeps the model from having to re-learn basic attention patterns.
+        with torch.no_grad():
+            if attention_type == "long_attention":
+                # Copy for Local Branch
+                new_attn.local_attention.q_proj.weight.copy_(original_attn.q_proj.weight)
+                new_attn.local_attention.k_proj.weight.copy_(original_attn.k_proj.weight)
+                new_attn.local_attention.v_proj.weight.copy_(original_attn.v_proj.weight)
+                if hasattr(original_attn.q_proj, 'bias') and original_attn.q_proj.bias is not None:
+                    new_attn.local_attention.q_proj.bias.copy_(original_attn.q_proj.bias)
+                    new_attn.local_attention.k_proj.bias.copy_(original_attn.k_proj.bias)
+                    new_attn.local_attention.v_proj.bias.copy_(original_attn.v_proj.bias)
+                
+                # Copy for Long-range Retrieval Queries (all types initialized with same base)
+                for qp in new_attn.typed_retrieval.q_projs:
+                    qp.weight.copy_(original_attn.q_proj.weight)
+                    if original_attn.q_proj.bias is not None:
+                        qp.bias.copy_(original_attn.q_proj.bias)
+                
+                # Copy for Dependency Gist (K, V projections)
+                hidden_size = original_attn.embed_dim
+                for tp in new_attn.typed_gist.type_projs:
+                    # tp.weight is (2*D, D) because it produces both K and V
+                    tp.weight[:hidden_size].copy_(original_attn.k_proj.weight)
+                    tp.weight[hidden_size:].copy_(original_attn.v_proj.weight)
+                    # tp.bias is (2*D)
+                    if original_attn.k_proj.bias is not None:
+                        tp.bias[:hidden_size].copy_(original_attn.k_proj.bias)
+                        tp.bias[hidden_size:].copy_(original_attn.v_proj.bias)
+
+                # Copy Final Output Projection
+                new_attn.out_proj.weight.copy_(original_attn.out_proj.weight)
+                if hasattr(original_attn.out_proj, 'bias') and original_attn.out_proj.bias is not None:
+                    new_attn.out_proj.bias.copy_(original_attn.out_proj.bias)
+
+            elif attention_type == "led":
+                # LED also benefits from inheriting BART's weights
+                new_attn.q_proj.weight.copy_(original_attn.q_proj.weight)
+                new_attn.k_proj.weight.copy_(original_attn.k_proj.weight)
+                new_attn.v_proj.weight.copy_(original_attn.v_proj.weight)
+                # Official LED global projections often start as copies of local
+                new_attn.q_proj_global.weight.copy_(original_attn.q_proj.weight)
+                new_attn.k_proj_global.weight.copy_(original_attn.k_proj.weight)
+                new_attn.v_proj_global.weight.copy_(original_attn.v_proj.weight)
+                
+                new_attn.out_proj.weight.copy_(original_attn.out_proj.weight)
+                if hasattr(original_attn.q_proj, 'bias') and original_attn.q_proj.bias is not None:
+                    new_attn.q_proj.bias.copy_(original_attn.q_proj.bias)
+                    new_attn.k_proj.bias.copy_(original_attn.k_proj.bias)
+                    new_attn.v_proj.bias.copy_(original_attn.v_proj.bias)
+                    new_attn.q_proj_global.bias.copy_(original_attn.q_proj.bias)
+                    new_attn.k_proj_global.bias.copy_(original_attn.k_proj.bias)
+                    new_attn.v_proj_global.bias.copy_(original_attn.v_proj.bias)
+                if hasattr(original_attn.out_proj, 'bias') and original_attn.out_proj.bias is not None:
+                    new_attn.out_proj.bias.copy_(original_attn.out_proj.bias)
+
         replaced_count += 1
 
     logger.info("Injection complete: %d Encoder layer(s) replaced with '%s'.", replaced_count, attention_type)

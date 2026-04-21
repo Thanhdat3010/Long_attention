@@ -19,13 +19,18 @@ This is equivalent to standard SDPA on a windowed token subset.
 
 import math
 import logging
-from typing import Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Tuple
+
+import transformers
+from packaging import version
 
 logger = logging.getLogger(__name__)
+
+# Transformers >= 4.36 changed BartEncoderLayer signature from 3-tuple to 2-tuple return expectation
+TRANSFORMERS_NEW_SIG = version.parse(transformers.__version__) >= version.parse("4.36.0")
 
 
 class LocalSlidingWindowAttention(nn.Module):
@@ -69,7 +74,8 @@ class LocalSlidingWindowAttention(nn.Module):
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
+        # self.out_proj is now managed by the parent LongAttention module
+        # to ensure local and long-range branches are projected together.
 
         self.attn_dropout = nn.Dropout(p=dropout_prob)
 
@@ -92,15 +98,17 @@ class LocalSlidingWindowAttention(nn.Module):
         Build a boolean mask enforcing the sliding-window constraint.
 
         Returns a (seq_len, seq_len) boolean tensor where True = attend, False = mask.
-        Each row i can attend only to positions in [max(0, i-W+1), i].
+        Each row i can attend only to positions where |i - j| <= window_size // 2.
         """
         idx = torch.arange(seq_len, device=device)
-        # row i, col j: attend if  0 <= j <= i  AND  i - j < window_size
         row = idx.unsqueeze(1)  # (T, 1)
         col = idx.unsqueeze(0)  # (1, T)
-        causal_mask = col <= row                        # causal
-        window_mask = (row - col) < self.window_size   # within window
-        return causal_mask & window_mask  # (T, T) bool
+        
+        # Symmetric sliding window (Bidirectional context for Encoder)
+        radius = self.window_size // 2
+        window_mask = torch.abs(row - col) <= radius
+        
+        return window_mask  # (T, T) bool
 
     def forward(
         self,
@@ -155,8 +163,11 @@ class LocalSlidingWindowAttention(nn.Module):
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
 
         # Weighted sum of values
-        context = torch.matmul(attn_weights, V)  # (B, H, T, dk)
-        context = self._merge_heads(context)     # (B, T, D)
-        output = self.out_proj(context)
-        # BART expects a 3-tuple: (output, attn_weights, past_key_value)
-        return (output, attn_weights if output_attentions else None, past_key_value)
+        context = self._merge_heads(torch.matmul(attn_weights, V))  # (B, T, D)
+        
+        # BART expects (output, attn_weights, past_key_value)
+        # Note: 'context' here is pre-projection.
+        if TRANSFORMERS_NEW_SIG:
+            return (context, attn_weights if output_attentions else None)
+        else:
+            return (context, attn_weights if output_attentions else None, past_key_value)
