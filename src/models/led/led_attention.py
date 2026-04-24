@@ -1,6 +1,14 @@
 """
 LED Attention: Sliding Window with Global Tokens.
+
 A BART-compatible implementation of Longformer-style attention for LED experiments.
+Algorithm faithfully ported from Google Research's Long Range Arena (LRA) repo:
+https://github.com/google-research/long-range-arena/blob/master/lra_benchmarks/models/longformer/longformer_attention.py
+
+Key design (matching LRA):
+  1. Two separate sets of Q/K/V projections: one for sliding-window, one for global.
+  2. Two independent attention computations (local path + global path).
+  3. Final output merged via torch.where based on global_attention_mask.
 """
 import math
 import torch
@@ -76,62 +84,62 @@ class LEDSelfAttention(nn.Module):
             global_attention_mask = global_attention_mask.bool()
 
         # 1. Compute Local and Global Projections
-        Q_local = self.q_proj(hidden_states)
-        K_local = self.k_proj(hidden_states)
-        V_local = self.v_proj(hidden_states)
+        Q_local = self._split_heads(self.q_proj(hidden_states))
+        K_local = self._split_heads(self.k_proj(hidden_states))
+        V_local = self._split_heads(self.v_proj(hidden_states))
         
-        Q_global = self.q_proj_global(hidden_states)
-        K_global = self.k_proj_global(hidden_states)
-        V_global = self.v_proj_global(hidden_states)
+        Q_global = self._split_heads(self.q_proj_global(hidden_states))
+        K_global = self._split_heads(self.k_proj_global(hidden_states))
+        V_global = self._split_heads(self.v_proj_global(hidden_states))
         
-        # 2. Select representations based on global_attention_mask
-        mask_expanded = global_attention_mask.unsqueeze(-1) # (B, T, 1)
+        # 2. Local Path (Sliding Window + Global Tokens access)
+        # Note: In LRA, non-global tokens see global tokens via Local Projections (K_local)
+        scores_local = torch.matmul(Q_local, K_local.transpose(-2, -1)) / self.scale
         
-        # If token is global, use global projections, else local
-        Q = torch.where(mask_expanded, Q_global, Q_local)
-        K = torch.where(mask_expanded, K_global, K_local)
-        V = torch.where(mask_expanded, V_global, V_local)
-        
-        Q = self._split_heads(Q) # (B, H, T, d_k)
-        K = self._split_heads(K)
-        V = self._split_heads(V)
-
-        # Standard Attention Scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale # (B, H, T, T)
-
-        # 3. Sliding Window Mask (Symmetric for Encoder)
         idx = torch.arange(T, device=device)
-        row = idx.unsqueeze(1)
-        col = idx.unsqueeze(0)
-        mask_window = (row - col).abs() <= (self.window_size // 2)
-            
-        # Global tokens can see everything, and everything can see global tokens
+        mask_window = (idx.unsqueeze(1) - idx.unsqueeze(0)).abs() <= (self.window_size // 2)
         is_global = global_attention_mask # (B, T)
         
-        # Expand masks to (B, 1, T, T)
-        final_mask = mask_window.unsqueeze(0).unsqueeze(0).repeat(B, 1, 1, 1) # (B, 1, T, T)
-        final_mask = final_mask | is_global.unsqueeze(1).unsqueeze(-1) # Row is global
-        final_mask = final_mask | is_global.unsqueeze(1).unsqueeze(-2) # Col is global
-
-        # Apply mask
-        scores = scores.masked_fill(~final_mask, float("-inf"))
-
-        # External padding mask
+        # Final Local Mask: Window OR anyone-sees-global
+        final_mask_local = mask_window.unsqueeze(0).unsqueeze(0) | is_global.unsqueeze(1).unsqueeze(-2)
+        scores_local = scores_local.masked_fill(~final_mask_local, float("-inf"))
+        
         if attention_mask is not None:
-            scores = scores + attention_mask
-
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        context = torch.matmul(attn_weights, V)
-        context = self._merge_heads(context)
-        output = self.out_proj(context)
+            scores_local = scores_local + attention_mask
+        
+        attn_local = F.softmax(scores_local, dim=-1)
+        attn_local = torch.nan_to_num(attn_local, nan=0.0)
+        out_local = torch.matmul(self.attn_dropout(attn_local), V_local)
+        
+        # 3. Global Path (Global tokens see everything)
+        # Global tokens use Q_global to see everyone via K_global
+        scores_global = torch.matmul(Q_global, K_global.transpose(-2, -1)) / self.scale
+        
+        # Global mask: only global tokens' rows are active, but they see all columns
+        # However, LRA's _get_attention_result for global uses full_global_mask
+        # which allows global-to-all and all-to-global.
+        # But since we merge at the end, only the rows of global tokens matter here.
+        if attention_mask is not None:
+            scores_global = scores_global + attention_mask
+            
+        attn_global = F.softmax(scores_global, dim=-1)
+        attn_global = torch.nan_to_num(attn_global, nan=0.0)
+        out_global = torch.matmul(self.attn_dropout(attn_global), V_global)
+        
+        # 4. Merge based on global_attention_mask (Like LRA line 266)
+        # (B, H, T, d_k)
+        is_global_expanded = is_global.unsqueeze(1).unsqueeze(-1) 
+        out = torch.where(is_global_expanded, out_global, out_local)
+        
+        out = self._merge_heads(out)
+        output = self.out_proj(out)
 
         # BART expects a 3-tuple: (output, attn_weights, past_key_value)
         output_attentions = kwargs.get("output_attentions", False)
-        # Multi-version compatibility (RTX 6000 vs A100)
+        # For output_attentions, we provide the merged weights
+        merged_weights = torch.where(is_global_expanded, attn_global, attn_local)
+
         if TRANSFORMERS_NEW_SIG:
-            return (output, attn_weights if output_attentions else None)
+            return (output, merged_weights if output_attentions else None)
         else:
-            return (output, attn_weights if output_attentions else None, None)
+            return (output, merged_weights if output_attentions else None, None)

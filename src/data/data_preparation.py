@@ -229,7 +229,6 @@ def download_and_cache_dataset(
         dataframes[split_name] = df
 
     return dataframes
-    return dataframes
 
 
 # ---------------------------------------------------------------------------

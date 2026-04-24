@@ -197,9 +197,11 @@ logger = logging.getLogger(__name__)
 class BARTDenoisingCollator:
     """
     Data Collator for BART Self Pre-training (SPT).
-    Implements Text Infilling: random spans of tokens are replaced with a single [MASK].
+    Implements BART-style Text Infilling: random spans (Poisson λ=3) are each
+    replaced with a single [MASK] token, so the model learns to predict how
+    many tokens are missing per span.
     """
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, mask_ratio: float = 0.3, poisson_lambda: float = 3.0):
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, mask_ratio: float = 0.15, poisson_lambda: float = 3.0):
         self.tokenizer = tokenizer
         self.mask_ratio = mask_ratio
         self.poisson_lambda = poisson_lambda
@@ -207,59 +209,93 @@ class BARTDenoisingCollator:
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # Handle pre-tokenized inputs: Pad them to the same length in the batch
         if "input_ids" in examples[0]:
-            # For SPT denoising, we reconstruct labels from input_ids. 
-            # We strip existing 'labels' to avoid padding conflicts if they have different lengths.
             features = [
                 {"input_ids": ex["input_ids"], "attention_mask": ex["attention_mask"]} 
                 for ex in examples
             ]
-            # Hardcode max_length to 1024 to prevent OverflowError in some environments
-            # where model_max_length defaults to a huge number.
             batch = self.tokenizer.pad(
-                features, 
-                return_tensors="pt", 
-                padding="max_length", 
-                max_length=1024
+                features, return_tensors="pt", padding="max_length", max_length=1024
             )
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
         else:
-            # Fallback for raw text inputs
             texts = [str(ex.get("source", ex.get("text", ""))) for ex in examples]
             inputs = self.tokenizer(
-                texts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, 
+                texts, return_tensors="pt", padding=True, truncation=True,
                 max_length=self.tokenizer.model_max_length
             )
             input_ids = inputs["input_ids"]
             attention_mask = inputs["attention_mask"]
 
+        # Labels = original uncorrupted sequence (decoder reconstructs full text)
         labels = input_ids.clone()
-        
-        # Create mask
-        # Simplified Text Infilling: Mask tokens with mask_ratio probability
-        # In a real BART SPT, you'd use Poisson distribution for spans.
-        # Here we use a standard MLM-like collator for simplicity but targeting BART.
-        probability_matrix = torch.full(labels.shape, self.mask_ratio)
-        special_tokens_mask = [
-            self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
-        ]
-        probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
-        
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-        
-        # BART specific: labels stay original, input_ids get [MASK]
-        input_ids[masked_indices] = self.tokenizer.mask_token_id if self.tokenizer.mask_token_id is not None else self.tokenizer.convert_tokens_to_ids("<mask>")
-        
-        # Replace -100 in labels for positions that are NOT masked? 
-        # No, for BART denoising, the decoder predicts the FULL uncorrupted sequence.
-        # So labels = original input_ids.
-        
+        batch_size, seq_len = input_ids.shape
+
+        mask_id = self.tokenizer.mask_token_id
+        if mask_id is None:
+            mask_id = self.tokenizer.convert_tokens_to_ids("<mask>")
+        pad_id = self.tokenizer.pad_token_id
+
+        new_input_ids = torch.full_like(input_ids, pad_id)
+        new_attention_mask = torch.zeros_like(attention_mask)
+
+        for i in range(batch_size):
+            ids = input_ids[i].tolist()
+            content_len = int(attention_mask[i].sum().item())
+
+            # Identify maskable positions (skip special tokens like <s>, </s>, <pad>)
+            special_mask = self.tokenizer.get_special_tokens_mask(
+                ids[:content_len], already_has_special_tokens=True
+            )
+            maskable = [j for j in range(content_len) if not special_mask[j]]
+            num_to_mask = max(1, int(len(maskable) * self.mask_ratio))
+
+            # Sample spans with Poisson-distributed lengths
+            spans = []
+            masked_count = 0
+            used = set()
+
+            while masked_count < num_to_mask:
+                span_len = max(1, int(np.random.poisson(self.poisson_lambda)))
+                span_len = min(span_len, num_to_mask - masked_count)
+                available = [p for p in maskable if p not in used]
+                if not available:
+                    break
+                start = available[np.random.randint(len(available))]
+                # Build contiguous span from the chosen start
+                span = []
+                for pos in range(start, min(start + span_len, content_len)):
+                    if pos in used or special_mask[pos]:
+                        break
+                    span.append(pos)
+                    used.add(pos)
+                if span:
+                    spans.append((span[0], span[-1] + 1))  # [start, end)
+                    masked_count += len(span)
+
+            spans.sort()  # Sort by position for sequential reconstruction
+
+            # Build corrupted sequence: replace each span with a single <mask>
+            new_ids = []
+            pos = 0
+            span_idx = 0
+            while pos < content_len:
+                if span_idx < len(spans) and pos == spans[span_idx][0]:
+                    new_ids.append(mask_id)
+                    pos = spans[span_idx][1]  # Skip entire span
+                    span_idx += 1
+                else:
+                    new_ids.append(ids[pos])
+                    pos += 1
+
+            # Write back with padding
+            new_len = min(len(new_ids), seq_len)
+            new_input_ids[i, :new_len] = torch.tensor(new_ids[:new_len])
+            new_attention_mask[i, :new_len] = 1
+
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
+            "input_ids": new_input_ids,
+            "attention_mask": new_attention_mask,
             "labels": labels
         }
 
@@ -346,16 +382,28 @@ class LongAttentionTrainer(Seq2SeqTrainer):
         # Standard CrossEntropy loss
         loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
         
-        # Collect Research Losses from layers
-        # We look for 'diversity_loss' and 'gate_val' attached to encoder outputs
+        # Collect Research Losses from layers (Find dynamically but fast)
         diversity_loss = torch.tensor(0.0, device=loss.device)
         gate_val = torch.tensor(0.0, device=loss.device)
         count = 0
         
-        # Search in the model's encoder for LongAttention layers
-        for module in model.modules():
-            from ..models.long_attention import LongAttention
-            if isinstance(module, LongAttention):
+        # Fast-path for BART: access layers directly
+        # Handle cases where model is wrapped in DDP or other wrappers
+        base_model = model
+        while hasattr(base_model, "module"): # Unwrap DDP/FSDP if needed
+            base_model = base_model.module
+        
+        # Access encoder layers directly from BART/LED structure
+        if hasattr(base_model, "model") and hasattr(base_model.model, "encoder"):
+            for layer in base_model.model.encoder.layers:
+                module = layer.self_attn
+                if hasattr(module, 'last_diversity_loss'):
+                    diversity_loss += module.last_diversity_loss
+                    gate_val += module.last_gate_val
+                    count += 1
+        else:
+            # Fallback to general but slower search if architecture is unexpected
+            for module in model.modules():
                 if hasattr(module, 'last_diversity_loss'):
                     diversity_loss += module.last_diversity_loss
                     gate_val += module.last_gate_val
@@ -398,11 +446,18 @@ class LongAttentionTrainer(Seq2SeqTrainer):
 def build_training_args(
     args: Namespace, 
     output_dir: str, 
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 1,
+    learning_rate_override: float = None,
 ) -> Seq2SeqTrainingArguments:
     """
     Construct HuggingFace Seq2SeqTrainingArguments from argparse Namespace.
+
+    Args:
+        learning_rate_override: If set, use this LR instead of args.learning_rate.
+                                Used to set a separate LR for SPT vs Fine-tuning.
     """
+    effective_lr = learning_rate_override if learning_rate_override is not None else args.learning_rate
+
     # Build kwargs dynamically for version compatibility
     training_kwargs = {
         "output_dir": output_dir,
@@ -416,7 +471,7 @@ def build_training_args(
         "per_device_train_batch_size": args.batch_size,
         "per_device_eval_batch_size": args.batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
-        "learning_rate": args.learning_rate,
+        "learning_rate": effective_lr,
         "weight_decay": 0.01,
         "num_train_epochs": args.epochs,
         "lr_scheduler_type": "linear",
@@ -429,6 +484,7 @@ def build_training_args(
         "greater_is_better": True,
         "report_to": "tensorboard",
         "disable_tqdm": True, # Disable default TQDM to let our custom bar run smoothly
+        "gradient_checkpointing": getattr(args, 'gradient_checkpointing', False),
     }
 
     # Handle evaluation_strategy vs eval_strategy
@@ -455,11 +511,18 @@ def run_training(
     test_dataset: Optional[Dataset] = None,
     gradient_accumulation_steps: int = 1,
     is_spt: bool = False,
+    learning_rate_override: float = None,
 ) -> Dict[str, Any]:
     """
     Execute the training pipeline (SPT or Fine-tuning).
+
+    Args:
+        learning_rate_override: If set, use this LR instead of args.learning_rate.
     """
-    training_args = build_training_args(args, output_dir, gradient_accumulation_steps)
+    training_args = build_training_args(
+        args, output_dir, gradient_accumulation_steps,
+        learning_rate_override=learning_rate_override,
+    )
     
     # SPT uses a different collator and objective
     # Lazy imports to break circular dependency
@@ -471,8 +534,9 @@ def run_training(
     )
 
     if is_spt:
-        logger.info("Configuring for Self Pre-training (SPT)...")
-        collator = BARTDenoisingCollator(tokenizer)
+        spt_mask_ratio = getattr(args, 'spt_mask_ratio', 0.15)
+        logger.info("Configuring for Self Pre-training (SPT) — mask_ratio=%.2f...", spt_mask_ratio)
+        collator = BARTDenoisingCollator(tokenizer, mask_ratio=spt_mask_ratio)
         training_args.predict_with_generate = False # Don't evaluate with BLEU during SPT
         training_args.metric_for_best_model = "eval_loss" # Use loss for SPT
         training_args.greater_is_better = False

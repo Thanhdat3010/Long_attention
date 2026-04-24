@@ -112,11 +112,9 @@ class DependencyTypedGist(nn.Module):
     def __init__(self, hidden_size: int, num_types: int = 3):
         super().__init__()
         self.num_types = num_types
-        # Each type has its own semantic projection
-        self.type_projs = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size * 2, bias=True) 
-            for _ in range(num_types)
-        ])
+        # Consolidated projection for all types, Keys, and Values: 
+        # (hidden_size * 2 for K and V, multiplied by num_types)
+        self.multi_type_proj = nn.Linear(hidden_size, hidden_size * 2 * num_types, bias=True)
         
     def forward(self, R_encoded: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -125,15 +123,18 @@ class DependencyTypedGist(nn.Module):
             V_typed: (B, num_types, T, D)
         """
         B, T, D = R_encoded.shape
-        ks, vs = [], []
-        for proj in self.type_projs:
-            kv = proj(R_encoded) # (B, T, 2*D)
-            k, v = kv.chunk(2, dim=-1)
-            ks.append(k.unsqueeze(1))
-            vs.append(v.unsqueeze(1))
         
-        K_typed = torch.cat(ks, dim=1) # (B, num_types, T, D)
-        V_typed = torch.cat(vs, dim=1) # (B, num_types, T, D)
+        # 1. Project all types, keys, and values at once
+        kv_all = self.multi_type_proj(R_encoded) # (B, T, num_types * 2 * D)
+        
+        # 2. Reshape to separate types, and K/V
+        # Shape: (B, T, num_types, 2, D)
+        kv_all = kv_all.view(B, T, self.num_types, 2, D)
+        
+        # 3. Extract K and V, transpose to (B, num_types, T, D)
+        K_typed = kv_all[:, :, :, 0, :].transpose(1, 2)
+        V_typed = kv_all[:, :, :, 1, :].transpose(1, 2)
+        
         return K_typed, V_typed
 
 
@@ -158,11 +159,8 @@ class TypedTopKRetrieval(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.scale = math.sqrt(self.head_dim)
 
-        # Query projections: one per type to allow type-specific relevance
-        self.q_projs = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size, bias=True)
-            for _ in range(num_types)
-        ])
+        # Consolidated Query projection: one giant linear layer for all types
+        self.q_proj = nn.Linear(hidden_size, hidden_size * num_types, bias=True)
         
         # Type importance mixer: learns to weight Coref vs Lexical vs Discourse per token
         self.type_mixer = nn.Linear(hidden_size, num_types, bias=False)
@@ -186,53 +184,70 @@ class TypedTopKRetrieval(nn.Module):
         # 1. Compute Type Mixing Weights
         type_weights = F.softmax(self.type_mixer(hidden_states), dim=-1) # (B, T, num_types)
         
-        # 2. Parallel Retrieval for each type
-        type_outputs = []
-        all_attn_maps = []
+        # 2. Parallel Retrieval for all types (Vectorized Forward Pass)
+        # Project all queries at once: (B, T, num_types * D)
+        Q_all = self.q_proj(hidden_states)
         
-        for t_idx in range(self.num_types):
-            # Project query for this type
-            Q_t = self.q_projs[t_idx](hidden_states) # (B, T, D)
-            Q_t = Q_t.view(B, T, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, T, d_k)
-            
-            K_t = K_typed[:, t_idx].view(B, T, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, T, d_k)
-            V_t = V_typed[:, t_idx].view(B, T, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, T, d_k)
-            
-            # Scores: (B, H, T, T)
-            scores = torch.matmul(Q_t, K_t.transpose(-2, -1)) / self.scale
-            
-            # Apply padding mask (e.g., -inf on <PAD> tokens)
-            if attention_mask is not None:
-                # attention_mask is usually (B, 1, T, T) or (B, 1, 1, T) provided by HF
+        # Reshape Q: (B, T, num_types, H, d_k) -> permute -> (B, num_types, H, T, d_k)
+        Q = Q_all.view(B, T, self.num_types, self.num_heads, self.head_dim).permute(0, 2, 3, 1, 4)
+        
+        # K_typed, V_typed are (B, num_types, T, D)
+        # Reshape to (B, num_types, T, H, d_k) -> permute -> (B, num_types, H, T, d_k)
+        K = K_typed.view(B, self.num_types, T, self.num_heads, self.head_dim).permute(0, 1, 3, 2, 4)
+        V = V_typed.view(B, self.num_types, T, self.num_heads, self.head_dim).permute(0, 1, 3, 2, 4)
+        
+        # Scores: (B, num_types, H, T, T)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
+        # Apply padding mask (e.g., -inf on <PAD> tokens)
+        if attention_mask is not None:
+            # attention_mask is usually (B, 1, T, T) or (B, 1, 1, T)
+            if attention_mask.dim() == 4:
+                scores = scores + attention_mask.unsqueeze(1) # Broadcast to 5D
+            else:
                 scores = scores + attention_mask
 
-            # Top-K
-            if effective_k < T:
-                topk_values, _ = torch.topk(scores, k=effective_k, dim=-1)
-                threshold = topk_values[..., -1].unsqueeze(-1)
-                scores = scores.masked_fill(scores < threshold, float("-inf"))
-            
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-            all_attn_maps.append(attn_weights.mean(dim=1)) # Store avg head attention for diversity loss
-            
-            out_t = torch.matmul(self.attn_dropout(attn_weights), V_t) # (B, H, T, d_k)
-            out_t = out_t.transpose(1, 2).reshape(B, T, D)
-            type_outputs.append(out_t.unsqueeze(-2)) # (B, T, 1, D)
+        # Top-K filtering
+        if effective_k < T:
+            topk_values, _ = torch.topk(scores, k=effective_k, dim=-1)
+            threshold = topk_values[..., -1].unsqueeze(-1)
+            scores = scores.masked_fill(scores < threshold, float("-inf"))
+        
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+        
+        # Average head attention for diversity loss
+        # attn_weights shape: (B, num_types, H, T, T) -> mean over H -> (B, num_types, T, T)
+        all_attn_maps = attn_weights.mean(dim=2) 
+        
+        # Compute contextualized vectors: (B, num_types, H, T, d_k)
+        out = torch.matmul(self.attn_dropout(attn_weights), V) 
+        
+        # Reshape back to (B, T, num_types, D)
+        # from (B, num_types, H, T, d_k) -> (B, T, num_types, H, d_k) -> (B, T, num_types, D)
+        out = out.permute(0, 3, 1, 2, 4).reshape(B, T, self.num_types, D)
 
         # 3. Combine outputs via weights: O = sum_t w_t * O_t
-        A_long_stacked = torch.cat(type_outputs, dim=-2) # (B, T, num_types, D)
-        A_long = (A_long_stacked * type_weights.unsqueeze(-1)).sum(dim=-2) # (B, T, D)
+        A_long = (out * type_weights.unsqueeze(-1)).sum(dim=-2) # (B, T, D)
         
-        # 4. Compute Diversity Loss (Cosine similarity between attention maps)
-        # We want to minimize similarity between different type attention patterns
+        # 4. Compute Diversity Loss (Vectorized Total Variation Distance)
+        # TV(P,Q) = 0.5 * sum(|P - Q|), bounded [0, 1]
         diversity_loss = torch.tensor(0.0, device=hidden_states.device)
         if self.num_types > 1:
-            for i in range(self.num_types):
-                for j in range(i + 1, self.num_types):
-                    # Flatten T,T to compare patterns
-                    sim = F.cosine_similarity(all_attn_maps[i].view(B, -1), all_attn_maps[j].view(B, -1), dim=-1)
-                    diversity_loss += sim.mean()
+            # Create pairwise differences using broadcasting
+            # diffs: (B, num_types, num_types, T, T)
+            diffs = all_attn_maps.unsqueeze(2) - all_attn_maps.unsqueeze(1)
+            
+            # Sum over the last dimension (T), then mean over Batch and Sequence (T)
+            # tv_dist shape: (num_types, num_types)
+            tv_dist = 0.5 * torch.abs(diffs).sum(dim=-1).mean(dim=(0, 3))
+            
+            # Extract upper triangle without diagonal to get unique pairs
+            idx0, idx1 = torch.triu_indices(self.num_types, self.num_types, offset=1)
+            pairwise_tv = tv_dist[idx0, idx1]
+            
+            # Accumulate exactly as before: sum(1.0 - tv_dist)
+            diversity_loss = (1.0 - pairwise_tv).sum()
         
         return A_long, diversity_loss
 
@@ -334,8 +349,9 @@ class LongAttention(nn.Module):
         # FunctionalDecomposer.forward returns 3 values currently, let's keep it safe.
         R_encoded, A_encoded, _ = decomp_outputs
         
-        # 3. Build Typed Gists (K_t, V_t)
-        K_typed, V_typed = self.typed_gist(R_encoded + A_encoded)
+        # 3. Build Typed Gists (K_t, V_t) — Only from Semantic Roots
+        # Per Proposal: only semantically important tokens enter long-range memory
+        K_typed, V_typed = self.typed_gist(R_encoded)
         
         # 4. Typed Retrieval
         A_long, diversity_loss = self.typed_retrieval(

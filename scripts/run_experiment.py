@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.data_preparation import download_and_cache_dataset
-from src.models.model_factory import build_model, build_tokenizer
+from src.models import build_model, build_tokenizer
 from src.training.trainer import Seq2SeqDocumentDataset, run_training
 from src.utils.io_utils import (
     build_output_dir,
@@ -220,6 +220,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "LongAttention layers. Requires --attention_type long_attention."
         ),
     )
+    train_grp.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        default=False,
+        help="Enable gradient checkpointing to trade compute for VRAM savings.",
+    )
 
     # ── Output ───────────────────────────────────────────────────────────────
     out_grp = parser.add_argument_group("Output")
@@ -261,6 +267,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Number of epochs for SPT phase.",
+    )
+    res_grp.add_argument(
+        "--spt_learning_rate",
+        type=float,
+        default=None,
+        help="Learning rate for SPT phase. Defaults to --learning_rate if not set.",
+    )
+    res_grp.add_argument(
+        "--spt_mask_ratio",
+        type=float,
+        default=0.15,
+        help="Token masking ratio for SPT denoising (paper default: 0.15 for text).",
     )
 
     return parser
@@ -351,7 +369,34 @@ def main() -> None:
         torch_dtype=torch_dtype,
         attention_type=args.attention_type,
         long_attention_config=long_attention_config,
+        freeze_backbone=args.freeze_backbone,
     )
+
+    # ── Parameter Count Breakdown (important for paper) ─────────────────────
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    encoder_attn_params = 0
+    encoder_other_params = 0
+    decoder_params = 0
+    embed_params = 0
+    for name, p in model.named_parameters():
+        if "embed" in name or "shared" in name:
+            embed_params += p.numel()
+        elif "decoder" in name:
+            decoder_params += p.numel()
+        elif "encoder" in name and "self_attn" in name:
+            encoder_attn_params += p.numel()
+        elif "encoder" in name:
+            encoder_other_params += p.numel()
+    logger.info("═" * 50)
+    logger.info("Parameter Breakdown:")
+    logger.info("  Embedding/Shared  : {:>12,}".format(embed_params))
+    logger.info("  Encoder self_attn : {:>12,}  ← VARIABLE (attention mechanism)".format(encoder_attn_params))
+    logger.info("  Encoder other     : {:>12,}".format(encoder_other_params))
+    logger.info("  Decoder           : {:>12,}".format(decoder_params))
+    logger.info("  Total             : {:>12,}".format(total_params))
+    logger.info("  Trainable         : {:>12,}".format(trainable_params))
+    logger.info("═" * 50)
 
     if args.freeze_backbone and args.attention_type != "vanilla":
         logger.info("Freezing backbone — only Injected layers will be trained.")
@@ -392,6 +437,11 @@ def main() -> None:
         original_epochs = args.epochs
         args.epochs = args.spt_epochs
         
+        # Determine SPT learning rate
+        spt_lr = args.spt_learning_rate if args.spt_learning_rate is not None else args.learning_rate
+        logger.info("SPT config: epochs=%d | lr=%s | mask_ratio=%.2f", 
+                    args.spt_epochs, spt_lr, args.spt_mask_ratio)
+        
         run_training(
             model=model,
             tokenizer=tokenizer,
@@ -401,10 +451,11 @@ def main() -> None:
             output_dir=spt_output_dir,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             is_spt=True,
+            learning_rate_override=spt_lr,
         )
         # Restore epochs for Stage 2
         args.epochs = original_epochs
-        logger.info("SPT completed. Moving to Stage 2.")
+        logger.info("SPT completed. Model calibrated. Moving to Stage 2.")
     else:
         logger.info("[5/6] Skipping Stage 1 (SPT).")
 

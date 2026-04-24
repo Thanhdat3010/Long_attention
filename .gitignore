@@ -1,0 +1,44 @@
+# === Data (quá nặng, không push lên GitHub) ===
+data/
+data_g10/
+data_g25/
+*.csv
+
+# === Model outputs & checkpoints ===
+outputs/
+*.bin
+*.safetensors
+*.ckpt
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === Environment ===
+.env
+.venv/
+venv/
+env/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Logs & temp ===
+*.log
+scratch/
+wandb/
+runs/
