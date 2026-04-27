@@ -196,18 +196,18 @@ class TypedTopKRetrieval(nn.Module):
         K = K_typed.view(B, self.num_types, T, self.num_heads, self.head_dim).permute(0, 1, 3, 2, 4)
         V = V_typed.view(B, self.num_types, T, self.num_heads, self.head_dim).permute(0, 1, 3, 2, 4)
         
-        # Scores: (B, num_types, H, T, T)
+        # 2. Typed Top-K Retrieval (As per Proposal)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
         
-        # Apply padding mask (e.g., -inf on <PAD> tokens)
         if attention_mask is not None:
-            # attention_mask is usually (B, 1, T, T) or (B, 1, 1, T)
+            # Ensure mask dtype matches scores for consistent precision
+            attention_mask = attention_mask.to(dtype=scores.dtype)
             if attention_mask.dim() == 4:
-                scores = scores + attention_mask.unsqueeze(1) # Broadcast to 5D
+                scores = scores + attention_mask.unsqueeze(1)
             else:
                 scores = scores + attention_mask
 
-        # Top-K filtering
+        # --- THE ROUTING STEP (Top-K) ---
         if effective_k < T:
             topk_values, _ = torch.topk(scores, k=effective_k, dim=-1)
             threshold = topk_values[..., -1].unsqueeze(-1)
@@ -216,38 +216,29 @@ class TypedTopKRetrieval(nn.Module):
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         
-        # Average head attention for diversity loss
-        # attn_weights shape: (B, num_types, H, T, T) -> mean over H -> (B, num_types, T, T)
-        all_attn_maps = attn_weights.mean(dim=2) 
-        
-        # Compute contextualized vectors: (B, num_types, H, T, d_k)
+        # 3. Compute Diversity Loss (Optimized via Sampling)
+        # Uses squared difference instead of abs() for stronger gradient signal
+        # when types are still similar (gradient of x^2 = 2x vs gradient of |x| = sign(x) = 0 at origin)
+        diversity_loss = torch.tensor(0.0, device=hidden_states.device)
+        if self.num_types > 1 and self.training:
+            num_samples = min(128, T)
+            indices = torch.randperm(T, device=hidden_states.device)[:num_samples]
+            
+            # sampled_weights: (B, num_types, num_samples, T)
+            sampled_weights = attn_weights[:, :, :, indices, :].mean(dim=2)
+            
+            # Use Absolute Difference (TV Distance) for constant "push" force
+            diffs = sampled_weights.unsqueeze(2) - sampled_weights.unsqueeze(1)
+            tv_dist = 0.5 * torch.abs(diffs).sum(dim=-1).mean(dim=(0, 3))
+            idx0, idx1 = torch.triu_indices(self.num_types, self.num_types, offset=1)
+            diversity_loss = (1.0 - tv_dist[idx0, idx1]).sum()
+
+        # 4. Context Aggregation
         out = torch.matmul(self.attn_dropout(attn_weights), V) 
-        
-        # Reshape back to (B, T, num_types, D)
-        # from (B, num_types, H, T, d_k) -> (B, T, num_types, H, d_k) -> (B, T, num_types, D)
         out = out.permute(0, 3, 1, 2, 4).reshape(B, T, self.num_types, D)
 
-        # 3. Combine outputs via weights: O = sum_t w_t * O_t
+        # 5. Combine outputs via weights: O = sum_t w_t * O_t
         A_long = (out * type_weights.unsqueeze(-1)).sum(dim=-2) # (B, T, D)
-        
-        # 4. Compute Diversity Loss (Vectorized Total Variation Distance)
-        # TV(P,Q) = 0.5 * sum(|P - Q|), bounded [0, 1]
-        diversity_loss = torch.tensor(0.0, device=hidden_states.device)
-        if self.num_types > 1:
-            # Create pairwise differences using broadcasting
-            # diffs: (B, num_types, num_types, T, T)
-            diffs = all_attn_maps.unsqueeze(2) - all_attn_maps.unsqueeze(1)
-            
-            # Sum over the last dimension (T), then mean over Batch and Sequence (T)
-            # tv_dist shape: (num_types, num_types)
-            tv_dist = 0.5 * torch.abs(diffs).sum(dim=-1).mean(dim=(0, 3))
-            
-            # Extract upper triangle without diagonal to get unique pairs
-            idx0, idx1 = torch.triu_indices(self.num_types, self.num_types, offset=1)
-            pairwise_tv = tv_dist[idx0, idx1]
-            
-            # Accumulate exactly as before: sum(1.0 - tv_dist)
-            diversity_loss = (1.0 - pairwise_tv).sum()
         
         return A_long, diversity_loss
 
@@ -364,7 +355,6 @@ class LongAttention(nn.Module):
         
         # ── Output Integration ──
         # Formula: O = OutProj( LocalContext + g_i * LongContext )
-        # This perfectly matches standard Transformer output projection logic.
         combined_context = A_local + g_i * A_long
         output = self.out_proj(combined_context)
         

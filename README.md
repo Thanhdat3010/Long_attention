@@ -57,7 +57,7 @@ This codebase follows the **Self Pre-Training (SPT)** methodology:
                 ┌───────────────┼───────────────┐
                 │               │               │
             Model A         Model B         Model C
-           (Vanilla)         (LED)       (LongAttention)
+           (Vanilla)         (LED)         (LongAttention)
                 │               │               │
     ════════════╪═══════════════╪═══════════════╪════════════
     Stage 1:    │    SPT — Masked Denoising (15% masking)  │

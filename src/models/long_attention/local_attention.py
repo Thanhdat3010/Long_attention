@@ -78,6 +78,10 @@ class LocalSlidingWindowAttention(nn.Module):
         # to ensure local and long-range branches are projected together.
 
         self.attn_dropout = nn.Dropout(p=dropout_prob)
+        
+        # Cache for window mask to avoid O(T^2) re-computation
+        self.register_buffer("cached_mask", None, persistent=False)
+        self.cached_seq_len = 0
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         """Reshape (B, T, D) → (B, H, T, d_k)."""
@@ -141,29 +145,43 @@ class LocalSlidingWindowAttention(nn.Module):
         K = self._split_heads(self.k_proj(hidden_states))
         V = self._split_heads(self.v_proj(hidden_states))
 
-        # Scaled dot-product scores: (B, H, T, T)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-
-        # Apply sliding window mask (additive: -inf for masked positions)
-        window_mask = self._build_window_mask(T, device)  # (T, T)
-        # Convert bool mask to additive float mask
-        additive_window = torch.zeros(T, T, device=device, dtype=scores.dtype)
-        additive_window.masked_fill_(~window_mask, float("-inf"))
-        scores = scores + additive_window.unsqueeze(0).unsqueeze(0)
-
-        # Optional external attention mask (e.g., padding)
+        # ── Optimized Sliding Window Attention ──
+        # 1. Use cached mask if available and sequence length matches
+        if self.cached_mask is None or self.cached_seq_len != T:
+            window_mask = self._build_window_mask(T, device)
+            additive_window = torch.zeros(T, T, device=device, dtype=hidden_states.dtype)
+            additive_window.masked_fill_(~window_mask, float("-inf"))
+            self.cached_mask = additive_window.unsqueeze(0).unsqueeze(0) # (1, 1, T, T)
+            self.cached_seq_len = T
+        
+        full_mask = self.cached_mask
         if attention_mask is not None:
-            scores = scores + attention_mask
+            full_mask = full_mask + attention_mask
 
-        # Softmax + dropout
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
+        # CRITICAL: mask dtype must match hidden_states/Q/K/V for SDPA and consistent precision
+        if full_mask is not None:
+            full_mask = full_mask.to(dtype=hidden_states.dtype)
 
-        # NaN guard: positions that are fully masked (all -inf) produce NaN after softmax
-        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-
-        # Weighted sum of values
-        context = self._merge_heads(torch.matmul(attn_weights, V))  # (B, T, D)
+        # 2. Use F.scaled_dot_product_attention (SDPA) if on PyTorch 2.0+
+        # This is much faster than manual MatMul + Softmax
+        if hasattr(F, "scaled_dot_product_attention"):
+            # Note: SDPA handles scaling and dropout internally
+            context = F.scaled_dot_product_attention(
+                Q, K, V, 
+                attn_mask=full_mask, 
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=False
+            )
+            context = self._merge_heads(context)
+            attn_weights = None # Not returned by SDPA easily
+        else:
+            # Fallback for older PyTorch
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+            scores = scores + full_mask
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.attn_dropout(attn_weights)
+            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+            context = self._merge_heads(torch.matmul(attn_weights, V))
         
         # BART expects (output, attn_weights, past_key_value)
         # Note: 'context' here is pre-projection.

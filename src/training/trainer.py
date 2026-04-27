@@ -201,10 +201,11 @@ class BARTDenoisingCollator:
     replaced with a single [MASK] token, so the model learns to predict how
     many tokens are missing per span.
     """
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, mask_ratio: float = 0.15, poisson_lambda: float = 3.0):
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, mask_ratio: float = 0.15, poisson_lambda: float = 3.0, max_length: int = 1024):
         self.tokenizer = tokenizer
         self.mask_ratio = mask_ratio
         self.poisson_lambda = poisson_lambda
+        self.max_length = max_length
 
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # Handle pre-tokenized inputs: Pad them to the same length in the batch
@@ -214,7 +215,7 @@ class BARTDenoisingCollator:
                 for ex in examples
             ]
             batch = self.tokenizer.pad(
-                features, return_tensors="pt", padding="max_length", max_length=1024
+                features, return_tensors="pt", padding="max_length", max_length=self.max_length
             )
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
@@ -222,7 +223,7 @@ class BARTDenoisingCollator:
             texts = [str(ex.get("source", ex.get("text", ""))) for ex in examples]
             inputs = self.tokenizer(
                 texts, return_tensors="pt", padding=True, truncation=True,
-                max_length=self.tokenizer.model_max_length
+                max_length=self.max_length
             )
             input_ids = inputs["input_ids"]
             attention_mask = inputs["attention_mask"]
@@ -466,7 +467,7 @@ def build_training_args(
         "logging_strategy": "epoch",  # Revert to epoch to avoid JSON spam
         "save_strategy": "epoch",
         "predict_with_generate": True,
-        "generation_max_length": 1024, # Force sequence generation up to 1024 to prevent BLEU 0
+        "generation_max_length": getattr(args, 'max_target_length', 1024),
         "generation_num_beams": 4,     # Use beam search for higher translation quality
         "per_device_train_batch_size": args.batch_size,
         "per_device_eval_batch_size": args.batch_size,
@@ -536,18 +537,38 @@ def run_training(
     if is_spt:
         spt_mask_ratio = getattr(args, 'spt_mask_ratio', 0.15)
         logger.info("Configuring for Self Pre-training (SPT) — mask_ratio=%.2f...", spt_mask_ratio)
-        collator = BARTDenoisingCollator(tokenizer, mask_ratio=spt_mask_ratio)
+        collator = BARTDenoisingCollator(tokenizer, mask_ratio=spt_mask_ratio, max_length=args.max_source_length)
         training_args.predict_with_generate = False # Don't evaluate with BLEU during SPT
         training_args.metric_for_best_model = "eval_loss" # Use loss for SPT
         training_args.greater_is_better = False
         compute_metrics = None
+        eval_dataset_in_trainer = val_dataset
     else:
         collator = DataCollatorForSeq2Seq(tokenizer, model=model)
-        val_sources = val_dataset.data["source"].tolist() if hasattr(val_dataset, "data") else None
+        
+        # --- Fast Eval Logic (Subset) ---
+        val_subset_size = getattr(args, "max_val_samples_during_train", None)
+        if val_subset_size and val_subset_size < len(val_dataset):
+            logger.info("Fast Eval: Slicing val_dataset to %d for intermediate steps.", val_subset_size)
+            # Slice the dataframe and create a new dataset instance
+            subset_df = val_dataset.data.iloc[:val_subset_size]
+            eval_dataset_in_trainer = Seq2SeqDocumentDataset(
+                dataframe=subset_df,
+                tokenizer=tokenizer,
+                src_max_len=val_dataset.src_max_len,
+                tgt_max_len=val_dataset.tgt_max_len,
+            )
+            eval_dataset_in_trainer.data = subset_df
+        else:
+            eval_dataset_in_trainer = val_dataset
+
+        # --- Fast Eval Logic (COMET Toggle) ---
+        use_comet_during_train = getattr(args, "use_comet_during_train", False)
+        val_sources = eval_dataset_in_trainer.data["source"].tolist() if hasattr(eval_dataset_in_trainer, "data") else None
         compute_metrics = make_compute_metrics(
             tokenizer=tokenizer,
             sources_for_comet=val_sources,
-            use_comet=getattr(args, "use_comet", True),
+            use_comet=use_comet_during_train and getattr(args, "use_comet", True),
         )
 
     # Callbacks
@@ -566,7 +587,7 @@ def run_training(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        eval_dataset=eval_dataset_in_trainer, # Use subset for training
         tokenizer=tokenizer,
         data_collator=collator,
         compute_metrics=compute_metrics,
@@ -585,16 +606,24 @@ def run_training(
     trainer.save_metrics("train", train_result.metrics)
     trainer.save_model(output_dir)
 
-    # ------ Evaluation ------
+    # ------ Evaluation (FINAL - FULL) ------
     eval_metrics = {}
     if not is_spt:
-        logger.info("Running final evaluation (Val)...")
-        eval_metrics = trainer.evaluate()
+        logger.info("Running final FULL evaluation (Val)...")
+        # Switch to FULL val dataset and ENABLE COMET
+        val_sources_full = val_dataset.data["source"].tolist() if hasattr(val_dataset, "data") else None
+        trainer.compute_metrics = make_compute_metrics(
+            tokenizer=tokenizer,
+            sources_for_comet=val_sources_full,
+            use_comet=getattr(args, "use_comet", True), 
+        )
+        # Use the original full val_dataset
+        eval_metrics = trainer.evaluate(eval_dataset=val_dataset) 
         trainer.log_metrics("eval", eval_metrics)
         trainer.save_metrics("eval", eval_metrics)
 
         if test_dataset is not None:
-            logger.info("Running final evaluation (Test)...")
+            logger.info("Running final FULL evaluation (Test)...")
             test_sources = test_dataset.data["source"].tolist() if hasattr(test_dataset, "data") else None
             trainer.compute_metrics = make_compute_metrics(
                 tokenizer=tokenizer,

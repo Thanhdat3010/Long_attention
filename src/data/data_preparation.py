@@ -97,6 +97,7 @@ def _extract_translation_rows(
     tgt_lang: str,
     max_examples: Optional[int] = None,
     group_size: int = 1,
+    is_flat: bool = False, # True for datasets like CoCoDoc where langs are direct columns
 ) -> pd.DataFrame:
     """
     Extract source/target text from a HuggingFace split and optionally group
@@ -106,8 +107,9 @@ def _extract_translation_rows(
         hf_split:     A HuggingFace dataset split.
         src_lang:     Source language code (e.g., 'en').
         tgt_lang:     Target language code (e.g., 'fr').
-        max_examples: If set, stop reading from the source after this many SENTENCES.
+        max_examples: If set, stop reading from the source after this many SENTENCES (or docs if group_size=1).
         group_size:   Number of consecutive sentences to concatenate into a document.
+        is_flat:      If True, assume src_lang and tgt_lang are top-level columns.
     """
     sources, targets = [], []
     current_src_group, current_tgt_group = [], []
@@ -118,9 +120,13 @@ def _extract_translation_rows(
         if max_examples is not None and examples_read >= max_examples:
             break
             
-        translation: Dict[str, str] = example["translation"]
-        src_text = translation.get(src_lang, "").strip()
-        tgt_text = translation.get(tgt_lang, "").strip()
+        if is_flat:
+            src_text = example.get(src_lang, "").strip()
+            tgt_text = example.get(tgt_lang, "").strip()
+        else:
+            translation: Dict[str, str] = example.get("translation", {})
+            src_text = translation.get(src_lang, "").strip()
+            tgt_text = translation.get(tgt_lang, "").strip()
         
         if src_text and tgt_text:
             current_src_group.append(src_text)
@@ -139,8 +145,8 @@ def _extract_translation_rows(
 
     df = pd.DataFrame({"source": sources, "target": targets})
     logger.info(
-        "Extracted %d documents from %d source sentences (Group Size: %d)", 
-        len(df), examples_read, group_size
+        "Extracted %d documents from %d source samples (Group Size: %d, Flat: %s)", 
+        len(df), examples_read, group_size, is_flat
     )
     return df
 
@@ -171,12 +177,19 @@ def download_and_cache_dataset(
     logger.info("Cache not found. Processing %s...", dataset_name)
     
     # Decide between streaming and full download
-    # We use streaming for WMT14 or large datasets if a limit is specified
     use_streaming = (dataset_name == "wmt14") or (dataset_name == "HPLT/DocHPLT")
+    is_doc_level = (dataset_name == "FiveC/CoCoDoc-MT-20k")
+
+    if is_doc_level:
+        group_size = 1 # Already document level
+        logger.info("Dataset %s is already at document level. Setting group_size=1.", dataset_name)
 
     if dataset_name == "iwslt2017":
         hf_subset = f"iwslt2017-{src_lang}-{tgt_lang}"
         kwargs = {"trust_remote_code": True}
+    elif is_doc_level:
+        hf_subset = None # No config for this one
+        kwargs = {}
     else:
         hf_subset = f"{src_lang}-{tgt_lang}"
         kwargs = {}
@@ -184,6 +197,7 @@ def download_and_cache_dataset(
     try:
         raw_datasets = load_dataset(dataset_name, hf_subset, streaming=use_streaming, **kwargs)
     except Exception as e:
+        if is_doc_level: raise e # Don't retry if it's doc level and fails
         # Fallback for reversed language pairs (e.g., fr-en instead of en-fr)
         if dataset_name == "iwslt2017":
             hf_subset_reversed = f"iwslt2017-{tgt_lang}-{src_lang}"
@@ -224,6 +238,7 @@ def download_and_cache_dataset(
             tgt_lang=tgt_lang,
             max_examples=max_examples_map[split_name],
             group_size=group_size,
+            is_flat=is_doc_level,
         )
         _save_dataframe(df, _csv_path(data_dir, dataset_name, lang_pair, split_name))
         dataframes[split_name] = df

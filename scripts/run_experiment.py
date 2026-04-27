@@ -81,7 +81,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="N",
-        help="Limit validation rows to N.",
+        help="Limit validation rows to N (Full dataset used for final evaluation).",
+    )
+    data_grp.add_argument(
+        "--max_val_samples_during_train",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Limit validation samples to N ONLY during training epochs to speed up.",
     )
     data_grp.add_argument(
         "--max_test_samples",
@@ -89,6 +96,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="Limit test rows to N.",
+    )
+    data_grp.add_argument(
+        "--use_comet_during_train",
+        action="store_true",
+        help="If set, run COMET evaluation during training epochs (Warning: slow).",
     )
 
     # ── Model ────────────────────────────────────────────────────────────────
@@ -353,6 +365,8 @@ def main() -> None:
     # ── Step 2: Tokenizer ────────────────────────────────────────────────────
     logger.info("[2/5] Loading tokenizer…")
     tokenizer = build_tokenizer(args.backbone)
+    # Ensure tokenizer respects the extended length
+    tokenizer.model_max_length = args.max_source_length
 
     # ── Step 3: Model (+ optional injection) ─────────────────────────────────
     logger.info("[3/5] Building model (attention_type=%s)…", args.attention_type)
@@ -362,6 +376,7 @@ def main() -> None:
         "num_types": args.num_types,
         "bottleneck_ratio": args.bottleneck_ratio,
         "dropout_prob": args.dropout_prob,
+        "max_length": args.max_source_length, # Trigger length extension if > 1024
     }
     model = build_model(
         backbone=args.backbone,

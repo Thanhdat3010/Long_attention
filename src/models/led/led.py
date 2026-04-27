@@ -23,6 +23,44 @@ from .led_attention import LEDSelfAttention
 logger = logging.getLogger(__name__)
 
 
+def _extend_learned_position_embeddings(
+    model: nn.Module, 
+    new_max_length: int, 
+    offset: int = 2
+) -> None:
+    """
+    Extend the absolute learned position embeddings of a BART/RoBERTa model 
+    using the Copy/Repeat strategy (standardized by Longformer/LED).
+    """
+    embed_positions = model.embed_positions
+    current_max_pos = embed_positions.num_embeddings - offset
+    
+    if new_max_length <= current_max_pos:
+        return
+
+    logger.info(
+        f"Extending LED position embeddings: {current_max_pos} -> {new_max_length} "
+        f"(Strategy: Copy/Repeat)"
+    )
+
+    old_weights = embed_positions.weight.data
+    hidden_size = old_weights.size(-1)
+    
+    special_weights = old_weights[:offset]
+    pos_weights = old_weights[offset:]
+    
+    n_repeats = (new_max_length + current_max_pos - 1) // current_max_pos
+    extended_pos_weights = pos_weights.repeat(n_repeats, 1)
+    extended_pos_weights = extended_pos_weights[:new_max_length]
+    
+    new_weights = torch.cat([special_weights, extended_pos_weights], dim=0)
+    
+    new_embed_positions = type(embed_positions)(new_max_length, hidden_size)
+    new_embed_positions.weight.data = new_weights
+    
+    model.embed_positions = new_embed_positions
+
+
 def build_led_model(
     backbone: str = "facebook/bart-base",
     device_map: str = "auto",
@@ -55,6 +93,12 @@ def build_led_model(
         device_map=device_map,
         torch_dtype=torch_dtype,
     )
+
+    # ── Position Embedding Extension ────────────────────────────────────
+    max_length = config.get("max_length", 1024)
+    _extend_learned_position_embeddings(model.model.encoder, max_length)
+    _extend_learned_position_embeddings(model.model.decoder, max_length)
+    model.config.max_position_embeddings = max_length
 
     # Inject LED attention into all encoder layers
     layers = model.model.encoder.layers
