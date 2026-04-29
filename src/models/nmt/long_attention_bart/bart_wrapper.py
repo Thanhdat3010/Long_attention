@@ -9,8 +9,7 @@ import torch
 import torch.nn as nn
 from transformers import BartForConditionalGeneration, PreTrainedModel
 
-# Import the main attention container from attention.py
-from .attention import LongAttention
+from ...core.attention_core import LongAttention
 
 logger = logging.getLogger(__name__)
 

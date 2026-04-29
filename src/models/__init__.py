@@ -23,6 +23,7 @@ def build_tokenizer(backbone: str = "facebook/bart-base"):
 
 
 def build_model(
+    task: str = "nmt",
     backbone: str = "facebook/bart-base",
     device_map: str = "auto",
     torch_dtype: torch.dtype = torch.float32,
@@ -49,38 +50,58 @@ def build_model(
     Returns:
         BartForConditionalGeneration with the specified attention mechanism.
     """
-    if attention_type in ("standard", "vanilla"):
-        logger.info("Loading vanilla BART: %s (dtype=%s)", backbone, torch_dtype)
-        model = BartForConditionalGeneration.from_pretrained(
-            backbone, device_map=device_map, torch_dtype=torch_dtype
-        )
-        if freeze_backbone:
-            for param in model.parameters():
-                param.requires_grad = False
+    if task == "nmt":
+        if attention_type in ("standard", "vanilla"):
+            logger.info("Loading vanilla BART: %s (dtype=%s)", backbone, torch_dtype)
+            model = BartForConditionalGeneration.from_pretrained(
+                backbone, device_map=device_map, torch_dtype=torch_dtype
+            )
+            if freeze_backbone:
+                for param in model.parameters():
+                    param.requires_grad = False
+        elif attention_type == "led":
+            from .nmt.led_bart.bart_wrapper import build_led_model
+            model = build_led_model(
+                backbone=backbone,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+                config=long_attention_config,
+                freeze_backbone=freeze_backbone,
+            )
+        elif attention_type == "long_attention":
+            from .nmt.long_attention_bart.bart_wrapper import build_long_attention_model
+            model = build_long_attention_model(
+                backbone=backbone,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+                config=long_attention_config,
+                freeze_backbone=freeze_backbone,
+            )
+        else:
+            raise ValueError(f"Unknown NMT attention type: '{attention_type}'.")
 
-    elif attention_type == "led":
-        from .led import build_led_model
-        model = build_led_model(
-            backbone=backbone,
-            device_map=device_map,
-            torch_dtype=torch_dtype,
-            config=long_attention_config,
-            freeze_backbone=freeze_backbone,
-        )
+    elif task == "qa":
+        # For QA, we expect a RoBERTa backbone
+        # We pass num_labels=2 for start/end, and our wrappers add the Yes/No head
+        if long_attention_config is None:
+            long_attention_config = {}
+        long_attention_config["num_labels"] = 2
 
-    elif attention_type == "long_attention":
-        from .long_attention import build_long_attention_model
-        model = build_long_attention_model(
-            backbone=backbone,
-            device_map=device_map,
-            torch_dtype=torch_dtype,
-            config=long_attention_config,
-            freeze_backbone=freeze_backbone,
-        )
-
+        if attention_type in ("standard", "vanilla", "longformer"):
+            from .qa.longformer_roberta.roberta_wrapper import build_qa_longformer_model
+            model = build_qa_longformer_model(backbone, long_attention_config)
+            model.inject_longformer_attention(long_attention_config)
+            model.to(torch_dtype)
+            
+        elif attention_type == "long_attention":
+            from .qa.long_attention_roberta.roberta_wrapper import build_qa_long_attention_model
+            model = build_qa_long_attention_model(backbone, long_attention_config)
+            model.inject_long_attention(long_attention_config)
+            model.to(torch_dtype)
+        else:
+            raise ValueError(f"Unknown QA attention type: '{attention_type}'.")
     else:
-        raise ValueError(f"Unknown attention type: '{attention_type}'. "
-                         f"Choose from: 'vanilla', 'led', 'long_attention'.")
+        raise ValueError(f"Unknown task: '{task}'")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -13,9 +13,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.data_preparation import download_and_cache_dataset
+from src.nmt.data_preparation import download_and_cache_dataset
 from src.models import build_model, build_tokenizer
-from src.training.trainer import Seq2SeqDocumentDataset, run_training
+from src.nmt.trainer import Seq2SeqDocumentDataset, run_training
 from src.utils.io_utils import (
     build_output_dir,
     save_metrics,

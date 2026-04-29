@@ -20,7 +20,7 @@ import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
 
-from .metrics import compute_attention_sink_ratio, aggregate_sink_ratios
+from ..nmt.metrics import compute_attention_sink_ratio, aggregate_sink_ratios
 
 logger = logging.getLogger(__name__)
 
@@ -278,3 +278,26 @@ class CheckpointMetadataCallback(TrainerCallback):
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(self.metadata, f, indent=2, default=str)
         logger.info("Saved experiment metadata → %s", meta_path)
+
+# ---------------------------------------------------------------------------
+# GPUMemoryCallback
+# ---------------------------------------------------------------------------
+
+class GPUMemoryCallback(TrainerCallback):
+    """
+    Callback that logs GPU memory usage at the end of each log step.
+    Helps diagnose OOM issues by showing 'Reserved' vs 'Allocated' memory.
+    """
+    def on_log(self, args, state, control, **kwargs):
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(device) / (1024**3)
+            reserved = torch.cuda.memory_reserved(device) / (1024**3)
+            max_allocated = torch.cuda.max_memory_allocated(device) / (1024**3)
+            
+            logger.info(
+                f"[GPU Memory] Step {state.global_step}: "
+                f"Allocated: {allocated:.2f}GB | "
+                f"Reserved: {reserved:.2f}GB | "
+                f"Peak: {max_allocated:.2f}GB"
+            )

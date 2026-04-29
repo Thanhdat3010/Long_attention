@@ -42,35 +42,10 @@ from transformers import (
 from torch.utils.data import Dataset
 
 from ..utils.io_utils import save_metrics, save_model_artifacts
+from ..utils.callbacks import GPUMemoryCallback
 from .metrics import make_compute_metrics, estimate_model_gflops
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# GPUMemoryCallback: Tracks and logs VRAM usage
-# ---------------------------------------------------------------------------
-
-class GPUMemoryCallback(TrainerCallback):
-    """
-    Callback that logs GPU memory usage at the end of each log step.
-    Helps diagnose OOM issues by showing 'Reserved' vs 'Allocated' memory.
-    """
-    def on_log(self, args, state, control, **kwargs):
-        if torch.cuda.is_available():
-            # Get current device
-            device = torch.cuda.current_device()
-            allocated = torch.cuda.memory_allocated(device) / (1024**3)
-            reserved = torch.cuda.memory_reserved(device) / (1024**3)
-            max_allocated = torch.cuda.max_memory_allocated(device) / (1024**3)
-            
-            logger.info(
-                f"[GPU Memory] Step {state.global_step}: "
-                f"Allocated: {allocated:.2f}GB | "
-                f"Reserved: {reserved:.2f}GB | "
-                f"Peak: {max_allocated:.2f}GB"
-            )
-
 
 import sys
 
@@ -466,6 +441,7 @@ def build_training_args(
         "do_eval": True,
         "logging_strategy": "epoch",  # Revert to epoch to avoid JSON spam
         "save_strategy": "epoch",
+        "eval_strategy": "epoch",
         "predict_with_generate": True,
         "generation_max_length": getattr(args, 'max_target_length', 1024),
         "generation_num_beams": 4,     # Use beam search for higher translation quality
@@ -528,7 +504,7 @@ def run_training(
     # SPT uses a different collator and objective
     # Lazy imports to break circular dependency
     from .metrics import make_compute_metrics
-    from .callbacks import (
+    from ..utils.callbacks import (
         AttentionSinkCallback,
         CheckpointMetadataCallback,
         GateDiversityCallback
