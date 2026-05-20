@@ -92,10 +92,13 @@ class NecessityGate(nn.Module):
     def __init__(self, hidden_size: int, bottleneck_ratio: float = 0.25):
         super().__init__()
         bottleneck = max(1, int(hidden_size * bottleneck_ratio))
+        # bias=-1.0 → sigmoid(-1)≈0.27: balanced start, not too open (noise), not too closed (dead)
+        final_linear = nn.Linear(bottleneck, 1, bias=True)
+        nn.init.constant_(final_linear.bias, -1.0)
         self.gate = nn.Sequential(
             nn.Linear(hidden_size, bottleneck, bias=False),
             nn.SiLU(),
-            nn.Linear(bottleneck, 1, bias=False),
+            final_linear,
             nn.Sigmoid()
         )
 
@@ -217,8 +220,7 @@ class TypedTopKRetrieval(nn.Module):
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         
         # 3. Compute Diversity Loss (Optimized via Sampling)
-        # Uses squared difference instead of abs() for stronger gradient signal
-        # when types are still similar (gradient of x^2 = 2x vs gradient of |x| = sign(x) = 0 at origin)
+        # TV distance: 0.5 * sum|p - q|, constant gradient magnitude via sign()
         diversity_loss = torch.tensor(0.0, device=hidden_states.device)
         if self.num_types > 1 and self.training:
             num_samples = min(128, T)

@@ -138,10 +138,11 @@ class Seq2SeqDocumentDataset(Dataset):
             padding="max_length",
         )
 
+        import numpy as np
         return {
-            "input_ids": torch.tensor(source_enc["input_ids"], dtype=torch.long),
-            "attention_mask": torch.tensor(source_enc["attention_mask"], dtype=torch.long),
-            "labels": torch.tensor(target_enc["input_ids"], dtype=torch.long),
+            "input_ids": torch.as_tensor(np.array(source_enc["input_ids"], dtype=np.int64)),
+            "attention_mask": torch.as_tensor(np.array(source_enc["attention_mask"], dtype=np.int64)),
+            "labels": torch.as_tensor(np.array(target_enc["input_ids"], dtype=np.int64)),
         }
 
 
@@ -392,10 +393,10 @@ class LongAttentionTrainer(Seq2SeqTrainer):
             # 1. Diversity Loss: Encourage types to stay separate
             loss += self.diversity_weight * diversity_loss
             
-            # 2. Null-Route Calibration (With Dynamic Epoch-based Warmup)
-            # Dần dần áp dụng hình phạt trong 0.5 Epoch đầu tiên để tránh chết Cổng sớm
+            # 2. Null-Route Calibration (Dynamic Warmup over 0.5 epoch)
+            # Gate starts at ~0.27 (bias=-1.0), warmup lets long-range branch learn before penalizing
             current_epoch = self.state.epoch if self.state.epoch is not None else 0.0
-            warmup_epochs = 0.5 
+            warmup_epochs = 0.5
             
             if current_epoch < warmup_epochs:
                 warmup_factor = current_epoch / warmup_epochs

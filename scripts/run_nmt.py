@@ -376,7 +376,7 @@ def main() -> None:
         "num_types": args.num_types,
         "bottleneck_ratio": args.bottleneck_ratio,
         "dropout_prob": args.dropout_prob,
-        "max_length": args.max_source_length, # Trigger length extension if > 1024
+        "max_length": max(args.max_source_length, args.max_target_length), # Extend pos embeds for both encoder & decoder
     }
     model = build_model(
         backbone=args.backbone,
@@ -493,6 +493,128 @@ def main() -> None:
     logger.info("Saving final model artifacts…")
     save_model_artifacts(model, tokenizer, output_dir=output_dir, args=args)
     save_metrics(final_metrics, output_dir=output_dir, filename="metrics.json")
+
+    # ── Architectural Diagnostic Report ──────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("ARCHITECTURAL DIAGNOSTIC REPORT")
+    logger.info("=" * 60)
+
+    if args.attention_type in ("led", "long_attention"):
+        try:
+            import json as _json
+            model.eval()
+            diag_samples = 5
+            diag_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
+            diag_results = {"per_layer": {}, "summary": {}}
+
+            # Collect per-layer info via forward hooks
+            layer_gate_vals = {}    # layer_idx -> list of gate means
+            layer_div_losses = {}   # layer_idx -> list of div losses
+            layer_type_weights = {} # layer_idx -> list of type weight distributions
+            layer_decomp_gates = {} # layer_idx -> list of decomposer gate means
+
+            hooks = []
+            encoder_layers = model.model.encoder.layers
+
+            for idx, layer in enumerate(encoder_layers):
+                attn = layer.self_attn
+
+                if args.attention_type == "long_attention":
+                    # Hook on necessity gate
+                    def make_gate_hook(layer_id):
+                        def hook(module, inp, out):
+                            layer_gate_vals.setdefault(layer_id, []).append(out.mean().item())
+                        return hook
+                    hooks.append(attn.necessity_gate.register_forward_hook(make_gate_hook(idx)))
+
+                    # Hook on decomposer for gate_score
+                    def make_decomp_hook(layer_id):
+                        def hook(module, inp, out):
+                            if isinstance(out, tuple) and len(out) == 3:
+                                layer_decomp_gates.setdefault(layer_id, []).append(out[2].mean().item())
+                        return hook
+                    hooks.append(attn.decomposer.register_forward_hook(make_decomp_hook(idx)))
+
+                    # Hook on typed retrieval for type_weights and diversity_loss
+                    def make_retrieval_hook(layer_id):
+                        def hook(module, inp, out):
+                            if isinstance(out, tuple) and len(out) == 2:
+                                layer_div_losses.setdefault(layer_id, []).append(out[1].item())
+                            # Capture type mixer weights from input
+                            hidden = inp[0]  # hidden_states
+                            tw = torch.nn.functional.softmax(module.type_mixer(hidden), dim=-1)
+                            layer_type_weights.setdefault(layer_id, []).append(tw.mean(dim=(0, 1)).detach().cpu().tolist())
+                        return hook
+                    hooks.append(attn.typed_retrieval.register_forward_hook(make_retrieval_hook(idx)))
+
+            # Run forward pass on a few samples
+            with torch.no_grad():
+                for i, batch in enumerate(diag_loader):
+                    if i >= diag_samples:
+                        break
+                    batch = {k: v.to(model.device) for k, v in batch.items()}
+                    model(**batch)
+
+            # Remove hooks
+            for h in hooks:
+                h.remove()
+
+            # Log results
+            if args.attention_type == "long_attention":
+                logger.info("─" * 50)
+                logger.info("PER-LAYER DIAGNOSTICS (LongAttention v2)")
+                logger.info("─" * 50)
+                logger.info("%-8s | %-12s | %-12s | %-12s | %s", "Layer", "Gate(g_i)", "DivLoss", "Decomp Gate", "Type Weights")
+                logger.info("─" * 80)
+
+                all_gates = []
+                all_divs = []
+                for idx in range(len(encoder_layers)):
+                    g_mean = sum(layer_gate_vals.get(idx, [0])) / max(len(layer_gate_vals.get(idx, [1])), 1)
+                    d_mean = sum(layer_div_losses.get(idx, [0])) / max(len(layer_div_losses.get(idx, [1])), 1)
+                    decomp_mean = sum(layer_decomp_gates.get(idx, [0])) / max(len(layer_decomp_gates.get(idx, [1])), 1)
+                    tw_list = layer_type_weights.get(idx, [[]])
+                    if tw_list and tw_list[0]:
+                        tw_avg = [sum(x) / len(tw_list) for x in zip(*tw_list)]
+                        tw_str = " | ".join(f"T{t}={w:.3f}" for t, w in enumerate(tw_avg))
+                    else:
+                        tw_str = "N/A"
+                        tw_avg = []
+
+                    all_gates.append(g_mean)
+                    all_divs.append(d_mean)
+
+                    logger.info("%-8d | %-12.4f | %-12.4f | %-12.4f | %s", idx, g_mean, d_mean, decomp_mean, tw_str)
+
+                    diag_results["per_layer"][f"layer_{idx}"] = {
+                        "gate_mean": round(g_mean, 4),
+                        "diversity_loss": round(d_mean, 4),
+                        "decomposer_gate": round(decomp_mean, 4),
+                        "type_weights": [round(w, 4) for w in tw_avg],
+                    }
+
+                logger.info("─" * 80)
+                logger.info("SUMMARY:")
+                logger.info("  Gate activity (mean across layers) : %.4f", sum(all_gates) / len(all_gates))
+                logger.info("  Gate activity (std across layers)  : %.4f", (sum((g - sum(all_gates)/len(all_gates))**2 for g in all_gates) / len(all_gates))**0.5)
+                logger.info("  Diversity loss (mean)              : %.4f", sum(all_divs) / len(all_divs))
+                gate_open_pct = sum(1 for g in all_gates if g > 0.5) / len(all_gates) * 100
+                logger.info("  Layers with gate > 0.5             : %.0f%% (%d/%d)", gate_open_pct, sum(1 for g in all_gates if g > 0.5), len(all_gates))
+
+                diag_results["summary"] = {
+                    "gate_mean": round(sum(all_gates) / len(all_gates), 4),
+                    "diversity_loss_mean": round(sum(all_divs) / len(all_divs), 4),
+                    "layers_gate_over_0.5": f"{sum(1 for g in all_gates if g > 0.5)}/{len(all_gates)}",
+                }
+
+            # Save diagnostic report
+            diag_path = Path(output_dir) / "diagnostic_report.json"
+            with open(diag_path, "w") as f:
+                _json.dump(diag_results, f, indent=2)
+            logger.info("Diagnostic report saved → %s", diag_path)
+
+        except Exception as e:
+            logger.warning("Diagnostic report failed (non-critical): %s", e)
 
     logger.info("=" * 60)
     logger.info("Experiment complete. Results in: %s", output_dir)

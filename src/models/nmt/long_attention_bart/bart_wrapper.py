@@ -109,10 +109,10 @@ def build_long_attention_model(
                 new_attn.local_attention.v_proj.bias.copy_(original_attn.v_proj.bias)
 
             # (b) Long-range Retrieval Inheritance
-            # Use 5e-3 noise to break symmetry between dependency types
+            # 10% noise to break symmetry between dependency types
             q_w = new_attn.typed_retrieval.q_proj.weight
             q_w.copy_(original_attn.q_proj.weight.repeat(num_types, 1))
-            q_w.data += torch.randn_like(q_w.data) * 2e-2
+            q_w.data += torch.randn_like(q_w.data) * 0.1
             if original_attn.q_proj.bias is not None:
                 new_attn.typed_retrieval.q_proj.bias.copy_(original_attn.q_proj.bias.repeat(num_types))
 
@@ -120,7 +120,7 @@ def build_long_attention_model(
             kv_w = new_attn.typed_gist.multi_type_proj.weight
             kv_template_w = torch.cat([original_attn.k_proj.weight, original_attn.v_proj.weight], dim=0)
             kv_w.copy_(kv_template_w.repeat(num_types, 1))
-            kv_w.data += torch.randn_like(kv_w.data) * 2e-2
+            kv_w.data += torch.randn_like(kv_w.data) * 0.1
             
             if original_attn.k_proj.bias is not None:
                 kv_b = new_attn.typed_gist.multi_type_proj.bias
