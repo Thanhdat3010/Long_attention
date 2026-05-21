@@ -46,6 +46,71 @@ class QATrainer(Trainer):
             logs["div"] = round(self.latest_diversity_loss, 4)
         super().log(logs, *args, **kwargs)
 
+    def evaluate(
+        self,
+        eval_dataset: Optional[torch.utils.data.Dataset] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """
+        Run evaluation and collect profiling metrics (Latency, Memory, GFLOPS).
+        """
+        # Determine eval phase dynamically for progress bar description
+        old_phase = getattr(self, "eval_phase", None)
+        if metric_key_prefix == "test":
+            self.eval_phase = "Testing (Test Set)"
+        elif metric_key_prefix == "eval":
+            if old_phase is None or "Validation" in old_phase:
+                if self.state.global_step == 0:
+                    self.eval_phase = "Validation (Pre-check)"
+                elif self.state.global_step >= self.state.max_steps:
+                    self.eval_phase = "Validation (Final)"
+                else:
+                    self.eval_phase = f"Validation (Epoch {int(self.state.epoch) if self.state.epoch is not None else 0})"
+
+        # Reset peak memory tracker
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            
+        start_time = time.time()
+        
+        # Run standard evaluation
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset, 
+            ignore_keys=ignore_keys, 
+            metric_key_prefix=metric_key_prefix
+        )
+        
+        duration = time.time() - start_time
+        num_samples = len(eval_dataset) if eval_dataset is not None else 1
+        
+        # 1. Latency (ms per sample)
+        metrics[f"{metric_key_prefix}_latency_ms"] = (duration / num_samples) * 1000
+        
+        # 2. Peak Memory (MB)
+        if torch.cuda.is_available():
+            peak_mem = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            metrics[f"{metric_key_prefix}_peak_memory_mb"] = peak_mem
+            
+        # 3. Estimated GFLOPS (Inference)
+        seq_len = getattr(self.args, "max_length", 4096)
+        attn_type = getattr(self.args, "attention_type", "standard")
+        
+        try:
+            from ..nmt.metrics import estimate_model_gflops
+            gflops = estimate_model_gflops(
+                model=self.model,
+                seq_len=seq_len,
+                batch_size=1, # Report per-sample GFLOPS
+                attention_type=attn_type,
+                window_size=getattr(self.args, "local_window_size", 512)
+            )
+            metrics[f"{metric_key_prefix}_estimated_gflops"] = gflops
+        except Exception as e:
+            logger.warning("GFLOPS estimation failed: %s", e)
+            
+        return metrics
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
         Custom loss computation to add LongAttention research losses.
@@ -96,6 +161,7 @@ class SmoothQAProgressCallback(TrainerCallback):
     def __init__(self):
         self.pbar = None
         self.trainer = None
+        self.eval_pbar = None
 
     def on_train_begin(self, args, state, control, **kwargs):
         from tqdm.auto import tqdm
@@ -127,6 +193,33 @@ class SmoothQAProgressCallback(TrainerCallback):
         if self.pbar is not None:
             self.pbar.close()
             self.pbar = None
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        from tqdm.auto import tqdm
+        eval_dataloader = kwargs.get("eval_dataloader", None)
+        if eval_dataloader is not None:
+            phase = getattr(self.trainer, "eval_phase", "Validation")
+            self.eval_pbar = tqdm(
+                total=len(eval_dataloader),
+                desc=phase,
+                dynamic_ncols=True,
+                leave=False
+            )
+
+    def on_predict(self, args, state, control, **kwargs):
+        return self.on_evaluate(args, state, control, **kwargs)
+
+    def on_prediction_step(self, args, state, control, **kwargs):
+        if hasattr(self, "eval_pbar") and self.eval_pbar is not None:
+            self.eval_pbar.update(1)
+
+    def on_evaluate_end(self, args, state, control, **kwargs):
+        if hasattr(self, "eval_pbar") and self.eval_pbar is not None:
+            self.eval_pbar.close()
+            self.eval_pbar = None
+
+    def on_predict_end(self, args, state, control, **kwargs):
+        return self.on_evaluate_end(args, state, control, **kwargs)
 
 
 def run_qa_training(
@@ -242,6 +335,7 @@ def run_qa_training(
     eval_metrics = {}
     if not is_spt:
         logger.info("Running final FULL QA evaluation...")
+        trainer.eval_phase = "Validation (Final)"
         eval_metrics = trainer.evaluate(eval_dataset=val_dataset)
         logger.info(f"Final QA Metrics: {eval_metrics}")
         
@@ -250,6 +344,7 @@ def run_qa_training(
         import json
         import os
         
+        trainer.eval_phase = "Testing (Predictions)"
         preds = trainer.predict(val_dataset)
         # Handle tuple of predictions safely
         predictions_tuple = preds.predictions

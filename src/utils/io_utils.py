@@ -177,7 +177,7 @@ def setup_logging(
     try:
         import colorlog
         fmt = colorlog.ColoredFormatter(
-            "%(log_color)s%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            "%(asctime)s %(log_color)s[%(levelname)s]%(reset)s %(name)s: %(message)s",
             datefmt="%H:%M:%S",
             log_colors={
                 "DEBUG": "cyan",

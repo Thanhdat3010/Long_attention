@@ -124,7 +124,7 @@ def main():
         )
 
     # 5. Training (Fine-Tuning Phase)
-    run_qa_training(
+    final_metrics = run_qa_training(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
@@ -133,6 +133,31 @@ def main():
         output_dir=output_dir,
         is_spt=False,
     )
+
+    # Save final artifacts and metrics (matching NMT)
+    from src.utils.io_utils import save_model_artifacts, save_metrics
+    logger.info("Saving final model artifacts…")
+    save_model_artifacts(model, tokenizer, output_dir=output_dir, args=args)
+    save_metrics(final_metrics, output_dir=output_dir, filename="metrics.json")
+
+    # Print a beautiful Summary Card for QA metrics
+    logger.info("╔" + "═" * 58 + "╗")
+    logger.info("║" + " FINAL QA EXPERIMENT METRICS ".center(58) + "║")
+    logger.info("╠" + "═" * 38 + "╦" + "═" * 19 + "╣")
+    logger.info("║ {:<36} ║ {:<17} ║".format("Metric Name", "Value"))
+    logger.info("╠" + "═" * 38 + "╬" + "═" * 19 + "╣")
+    for k, v in sorted(final_metrics.items()):
+        if isinstance(v, float):
+            v_str = f"{v:.4f}"
+        else:
+            v_str = str(v)
+        # Handle long strings or truncate to fit
+        if len(k) > 34:
+            k = k[:31] + "..."
+        if len(v_str) > 15:
+            v_str = v_str[:12] + "..."
+        logger.info("║ {:<36} ║ {:>17} ║".format(k, v_str))
+    logger.info("╚" + "═" * 38 + "╩" + "═" * 19 + "╝")
 
 
 if __name__ == "__main__":

@@ -403,15 +403,23 @@ def main() -> None:
             encoder_attn_params += p.numel()
         elif "encoder" in name:
             encoder_other_params += p.numel()
-    logger.info("═" * 50)
-    logger.info("Parameter Breakdown:")
-    logger.info("  Embedding/Shared  : {:>12,}".format(embed_params))
-    logger.info("  Encoder self_attn : {:>12,}  ← VARIABLE (attention mechanism)".format(encoder_attn_params))
-    logger.info("  Encoder other     : {:>12,}".format(encoder_other_params))
-    logger.info("  Decoder           : {:>12,}".format(decoder_params))
-    logger.info("  Total             : {:>12,}".format(total_params))
-    logger.info("  Trainable         : {:>12,}".format(trainable_params))
-    logger.info("═" * 50)
+    # Format parameters nicely
+    def fmt_num(val):
+        return f"{val:>15,}"
+        
+    logger.info("╔" + "═" * 58 + "╗")
+    logger.info("║" + " MODEL PARAMETER BREAKDOWN ".center(58) + "║")
+    logger.info("╠" + "═" * 38 + "╦" + "═" * 19 + "╣")
+    logger.info("║ {:<36} ║ {:<17} ║".format("Component", "Parameters"))
+    logger.info("╠" + "═" * 38 + "╬" + "═" * 19 + "╣")
+    logger.info("║ {:<36} ║ {} ║".format("Embedding/Shared", fmt_num(embed_params)))
+    logger.info("║ {:<36} ║ {} ║".format("Encoder self_attn (Variable attn)", fmt_num(encoder_attn_params)))
+    logger.info("║ {:<36} ║ {} ║".format("Encoder other", fmt_num(encoder_other_params)))
+    logger.info("║ {:<36} ║ {} ║".format("Decoder", fmt_num(decoder_params)))
+    logger.info("╠" + "═" * 38 + "╬" + "═" * 19 + "╣")
+    logger.info("║ {:<36} ║ {} ║".format("Total Parameters", fmt_num(total_params)))
+    logger.info("║ {:<36} ║ {} ║".format("Trainable Parameters", fmt_num(trainable_params)))
+    logger.info("╚" + "═" * 38 + "╩" + "═" * 19 + "╝")
 
     if args.freeze_backbone and args.attention_type != "vanilla":
         logger.info("Freezing backbone — only Injected layers will be trained.")
@@ -561,11 +569,20 @@ def main() -> None:
 
             # Log results
             if args.attention_type == "long_attention":
-                logger.info("─" * 50)
-                logger.info("PER-LAYER DIAGNOSTICS (LongAttention v2)")
-                logger.info("─" * 50)
-                logger.info("%-8s | %-12s | %-12s | %-12s | %s", "Layer", "Gate(g_i)", "DivLoss", "Decomp Gate", "Type Weights")
-                logger.info("─" * 80)
+                def make_sparkline(val: float, width: int = 10) -> str:
+                    f = int(round(val * width))
+                    f = max(0, min(width, f))
+                    e = width - f
+                    pct = int(round(val * 100))
+                    return f"[{'█' * f}{'░' * e}] {pct:>3}% ({val:.4f})"
+
+                logger.info("╔" + "═" * 114 + "╗")
+                logger.info("║" + " PER-LAYER DIAGNOSTICS (LongAttention v2) ".center(114) + "║")
+                logger.info("╠" + "═" * 7 + "╦" + "═" * 30 + "╦" + "═" * 30 + "╦" + "═" * 10 + "╦" + "═" * 33 + "╣")
+                logger.info("║ {:^5} ║ {:^28} ║ {:^28} ║ {:^8} ║ {:^31} ║".format(
+                    "Layer", "Necessity Gate (g_i)", "Decomposer Gate", "Div Loss", "Type Weights"
+                ))
+                logger.info("╠" + "═" * 7 + "╬" + "═" * 30 + "╬" + "═" * 30 + "╬" + "═" * 10 + "╬" + "═" * 33 + "╣")
 
                 all_gates = []
                 all_divs = []
@@ -576,7 +593,7 @@ def main() -> None:
                     tw_list = layer_type_weights.get(idx, [[]])
                     if tw_list and tw_list[0]:
                         tw_avg = [sum(x) / len(tw_list) for x in zip(*tw_list)]
-                        tw_str = " | ".join(f"T{t}={w:.3f}" for t, w in enumerate(tw_avg))
+                        tw_str = " | ".join(f"T{t}={w:.2f}" for t, w in enumerate(tw_avg))
                     else:
                         tw_str = "N/A"
                         tw_avg = []
@@ -584,7 +601,9 @@ def main() -> None:
                     all_gates.append(g_mean)
                     all_divs.append(d_mean)
 
-                    logger.info("%-8d | %-12.4f | %-12.4f | %-12.4f | %s", idx, g_mean, d_mean, decomp_mean, tw_str)
+                    logger.info("║ {:^5} ║ {} ║ {} ║ {:^8.4f} ║ {:<31} ║".format(
+                        idx, make_sparkline(g_mean), make_sparkline(decomp_mean), d_mean, tw_str
+                    ))
 
                     diag_results["per_layer"][f"layer_{idx}"] = {
                         "gate_mean": round(g_mean, 4),
@@ -593,17 +612,23 @@ def main() -> None:
                         "type_weights": [round(w, 4) for w in tw_avg],
                     }
 
-                logger.info("─" * 80)
-                logger.info("SUMMARY:")
-                logger.info("  Gate activity (mean across layers) : %.4f", sum(all_gates) / len(all_gates))
-                logger.info("  Gate activity (std across layers)  : %.4f", (sum((g - sum(all_gates)/len(all_gates))**2 for g in all_gates) / len(all_gates))**0.5)
-                logger.info("  Diversity loss (mean)              : %.4f", sum(all_divs) / len(all_divs))
+                logger.info("╠" + "═" * 7 + "╬" + "═" * 30 + "╬" + "═" * 30 + "╬" + "═" * 10 + "╬" + "═" * 33 + "╣")
+                
+                # Summary card inside
+                g_mean_all = sum(all_gates) / len(all_gates)
+                d_mean_all = sum(all_divs) / len(all_divs)
                 gate_open_pct = sum(1 for g in all_gates if g > 0.5) / len(all_gates) * 100
-                logger.info("  Layers with gate > 0.5             : %.0f%% (%d/%d)", gate_open_pct, sum(1 for g in all_gates if g > 0.5), len(all_gates))
+                
+                logger.info("║" + " SUMMARY STATISTICS ".center(114) + "║")
+                logger.info("╠" + "═" * 114 + "╣")
+                logger.info("║  • Gate Activity (Mean across layers) : {:<74} ║".format(f"{g_mean_all:.4f}"))
+                logger.info("║  • Diversity Loss (Mean)             : {:<74} ║".format(f"{d_mean_all:.4f}"))
+                logger.info("║  • Layers with Gate > 0.5            : {:<74} ║".format(f"{gate_open_pct:.1f}% ({sum(1 for g in all_gates if g > 0.5)}/{len(all_gates)})"))
+                logger.info("╚" + "═" * 114 + "╝")
 
                 diag_results["summary"] = {
-                    "gate_mean": round(sum(all_gates) / len(all_gates), 4),
-                    "diversity_loss_mean": round(sum(all_divs) / len(all_divs), 4),
+                    "gate_mean": round(g_mean_all, 4),
+                    "diversity_loss_mean": round(d_mean_all, 4),
                     "layers_gate_over_0.5": f"{sum(1 for g in all_gates if g > 0.5)}/{len(all_gates)}",
                 }
 
@@ -616,11 +641,23 @@ def main() -> None:
         except Exception as e:
             logger.warning("Diagnostic report failed (non-critical): %s", e)
 
-    logger.info("=" * 60)
-    logger.info("Experiment complete. Results in: %s", output_dir)
+    logger.info("╔" + "═" * 58 + "╗")
+    logger.info("║" + " FINAL EXPERIMENT METRICS ".center(58) + "║")
+    logger.info("╠" + "═" * 38 + "╦" + "═" * 19 + "╣")
+    logger.info("║ {:<36} ║ {:<17} ║".format("Metric Name", "Value"))
+    logger.info("╠" + "═" * 38 + "╬" + "═" * 19 + "╣")
     for k, v in sorted(final_metrics.items()):
-        logger.info("  %-30s : %s", k, v)
-    logger.info("=" * 60)
+        if isinstance(v, float):
+            v_str = f"{v:.4f}"
+        else:
+            v_str = str(v)
+        # Handle long strings or truncate to fit
+        if len(k) > 34:
+            k = k[:31] + "..."
+        if len(v_str) > 15:
+            v_str = v_str[:12] + "..."
+        logger.info("║ {:<36} ║ {:>17} ║".format(k, v_str))
+    logger.info("╚" + "═" * 38 + "╩" + "═" * 19 + "╝")
 
 
 if __name__ == "__main__":
