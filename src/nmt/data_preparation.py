@@ -151,6 +151,56 @@ def _extract_translation_rows(
     return df
 
 
+def _is_cache_sufficient(
+    data_dir: str,
+    dataset_name: str,
+    lang_pair: str,
+    max_train_rows: Optional[int],
+    max_val_rows: Optional[int],
+    max_test_rows: Optional[int],
+) -> bool:
+    """
+    Check whether cached CSVs have enough rows for the current request.
+
+    Rules:
+      - If max_*_rows is None (full run), the cache is considered stale when
+        the cached CSV has a "suspiciously small" number of rows (<=100),
+        which strongly suggests it was produced by a previous smoke test.
+      - If max_*_rows is set, the cache is sufficient as long as it has at
+        least that many rows (the caller will truncate after loading).
+    """
+    SMOKE_TEST_THRESHOLD = 100  # Cached files with ≤100 rows are likely smoke-test artifacts
+
+    limits = {"train": max_train_rows, "val": max_val_rows, "test": max_test_rows}
+    for split_name, requested in limits.items():
+        csv_path = _csv_path(data_dir, dataset_name, lang_pair, split_name)
+        if not csv_path.is_file():
+            return False
+        cached_rows = sum(1 for _ in open(csv_path, encoding="utf-8")) - 1  # minus header
+        if cached_rows < 0:
+            cached_rows = 0
+
+        if requested is None:
+            # Full run requested — reject tiny caches from smoke tests
+            if cached_rows <= SMOKE_TEST_THRESHOLD:
+                logger.warning(
+                    "Cache stale for '%s': only %d rows (≤%d threshold). "
+                    "Will re-download full dataset.",
+                    split_name, cached_rows, SMOKE_TEST_THRESHOLD,
+                )
+                return False
+        else:
+            # Subset requested — cache is fine if it has at least that many rows
+            if cached_rows < requested:
+                logger.warning(
+                    "Cache insufficient for '%s': %d cached < %d requested. "
+                    "Will re-download.",
+                    split_name, cached_rows, requested,
+                )
+                return False
+    return True
+
+
 def download_and_cache_dataset(
     data_dir: str,
     dataset_name: str = "iwslt2017",
@@ -162,19 +212,37 @@ def download_and_cache_dataset(
 ) -> Dict[str, pd.DataFrame]:
     """
     Download/Stream a dataset, group sentences into docs, and cache.
+
+    Cache invalidation: If any cached CSV has fewer rows than needed
+    (e.g. a previous smoke test created tiny CSVs), the cache is
+    automatically invalidated and the full dataset is re-downloaded.
     """
     src_lang, tgt_lang = _parse_lang_pair(lang_pair)
 
-    # --- Fast path: load from cache ---
+    # --- Fast path: load from cache (with validation) ---
     if _all_csvs_exist(data_dir, dataset_name, lang_pair):
-        safe_ds = dataset_name.replace("/", "_")
-        logger.info( "Loading from cache: %s", data_dir)
-        return {
-            split: _load_dataframe(_csv_path(data_dir, dataset_name, lang_pair, split))
-            for split in CSV_NAMES
-        }
+        if _is_cache_sufficient(data_dir, dataset_name, lang_pair,
+                                max_train_rows, max_val_rows, max_test_rows):
+            logger.info("Loading from cache: %s", data_dir)
+            dfs = {
+                split: _load_dataframe(_csv_path(data_dir, dataset_name, lang_pair, split))
+                for split in CSV_NAMES
+            }
+            logger.info(
+                "Cache validated — train: %d | val: %d | test: %d",
+                len(dfs["train"]), len(dfs["val"]), len(dfs["test"]),
+            )
+            return dfs
+        else:
+            # Delete stale cache files so they get regenerated below
+            logger.info("Invalidating stale cache files…")
+            for split in CSV_NAMES:
+                p = _csv_path(data_dir, dataset_name, lang_pair, split)
+                if p.is_file():
+                    p.unlink()
+                    logger.info("  Deleted: %s", p)
 
-    logger.info("Cache not found. Processing %s...", dataset_name)
+    logger.info("Cache not found or invalidated. Processing %s…", dataset_name)
     
     # Decide between streaming and full download
     use_streaming = (dataset_name == "wmt14") or (dataset_name == "HPLT/DocHPLT")
@@ -204,7 +272,7 @@ def download_and_cache_dataset(
         else:
             hf_subset_reversed = f"{tgt_lang}-{src_lang}"
         
-        logger.warning("Subset '%s' failed, retrying with '%s'...", hf_subset, hf_subset_reversed)
+        logger.warning("Subset '%s' failed, retrying with '%s'…", hf_subset, hf_subset_reversed)
         raw_datasets = load_dataset(dataset_name, hf_subset_reversed, streaming=use_streaming, **kwargs)
 
     max_examples_map = {
@@ -231,7 +299,7 @@ def download_and_cache_dataset(
             dataframes[split_name] = pd.DataFrame(columns=["source", "target"])
             continue
 
-        logger.info(f"Processing {split_name} split...")
+        logger.info(f"Processing {split_name} split…")
         df = _extract_translation_rows(
             split_data,
             src_lang=src_lang,

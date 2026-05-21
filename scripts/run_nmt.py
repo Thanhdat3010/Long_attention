@@ -503,16 +503,21 @@ def main() -> None:
     save_metrics(final_metrics, output_dir=output_dir, filename="metrics.json")
 
     # ── Architectural Diagnostic Report ──────────────────────────────────────
-    logger.info("=" * 60)
+    logger.info("=" * 80)
     logger.info("ARCHITECTURAL DIAGNOSTIC REPORT")
-    logger.info("=" * 60)
+    logger.info("=" * 80)
 
     if args.attention_type in ("led", "long_attention"):
         try:
             import json as _json
+            import traceback as _tb
             model.eval()
             diag_samples = 5
-            diag_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
+            from transformers import DataCollatorForSeq2Seq
+            collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+            diag_loader = torch.utils.data.DataLoader(
+                val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn
+            )
             diag_results = {"per_layer": {}, "summary": {}}
 
             # Collect per-layer info via forward hooks
@@ -556,6 +561,7 @@ def main() -> None:
                     hooks.append(attn.typed_retrieval.register_forward_hook(make_retrieval_hook(idx)))
 
             # Run forward pass on a few samples
+            logger.info("Running diagnostic forward pass on %d val samples…", diag_samples)
             with torch.no_grad():
                 for i, batch in enumerate(diag_loader):
                     if i >= diag_samples:
@@ -567,29 +573,24 @@ def main() -> None:
             for h in hooks:
                 h.remove()
 
-            # Log results
+            # ── Log results (plain-text, copy-paste friendly) ─────────────
             if args.attention_type == "long_attention":
-                def make_sparkline(val: float, width: int = 10) -> str:
-                    f = int(round(val * width))
-                    f = max(0, min(width, f))
-                    e = width - f
-                    pct = int(round(val * 100))
-                    return f"[{'█' * f}{'░' * e}] {pct:>3}% ({val:.4f})"
-
-                logger.info("╔" + "═" * 114 + "╗")
-                logger.info("║" + " PER-LAYER DIAGNOSTICS (LongAttention v2) ".center(114) + "║")
-                logger.info("╠" + "═" * 7 + "╦" + "═" * 30 + "╦" + "═" * 30 + "╦" + "═" * 10 + "╦" + "═" * 33 + "╣")
-                logger.info("║ {:^5} ║ {:^28} ║ {:^28} ║ {:^8} ║ {:^31} ║".format(
-                    "Layer", "Necessity Gate (g_i)", "Decomposer Gate", "Div Loss", "Type Weights"
-                ))
-                logger.info("╠" + "═" * 7 + "╬" + "═" * 30 + "╬" + "═" * 30 + "╬" + "═" * 10 + "╬" + "═" * 33 + "╣")
+                num_layers = len(encoder_layers)
+                logger.info("")
+                logger.info("+" + "-" * 7 + "+" + "-" * 14 + "+" + "-" * 14 + "+" + "-" * 12 + "+" + "-" * 32 + "+")
+                logger.info("| {:^5} | {:^12} | {:^12} | {:^10} | {:^30} |".format(
+                    "Layer", "NecessGate", "DecompGate", "DivLoss", "TypeWeights"))
+                logger.info("+" + "-" * 7 + "+" + "-" * 14 + "+" + "-" * 14 + "+" + "-" * 12 + "+" + "-" * 32 + "+")
 
                 all_gates = []
                 all_divs = []
-                for idx in range(len(encoder_layers)):
-                    g_mean = sum(layer_gate_vals.get(idx, [0])) / max(len(layer_gate_vals.get(idx, [1])), 1)
-                    d_mean = sum(layer_div_losses.get(idx, [0])) / max(len(layer_div_losses.get(idx, [1])), 1)
-                    decomp_mean = sum(layer_decomp_gates.get(idx, [0])) / max(len(layer_decomp_gates.get(idx, [1])), 1)
+                for idx in range(num_layers):
+                    g_vals = layer_gate_vals.get(idx, [0])
+                    g_mean = sum(g_vals) / max(len(g_vals), 1)
+                    d_vals = layer_div_losses.get(idx, [0])
+                    d_mean = sum(d_vals) / max(len(d_vals), 1)
+                    dg_vals = layer_decomp_gates.get(idx, [0])
+                    decomp_mean = sum(dg_vals) / max(len(dg_vals), 1)
                     tw_list = layer_type_weights.get(idx, [[]])
                     if tw_list and tw_list[0]:
                         tw_avg = [sum(x) / len(tw_list) for x in zip(*tw_list)]
@@ -601,9 +602,8 @@ def main() -> None:
                     all_gates.append(g_mean)
                     all_divs.append(d_mean)
 
-                    logger.info("║ {:^5} ║ {} ║ {} ║ {:^8.4f} ║ {:<31} ║".format(
-                        idx, make_sparkline(g_mean), make_sparkline(decomp_mean), d_mean, tw_str
-                    ))
+                    logger.info("| {:^5} | {:>12.4f} | {:>12.4f} | {:>10.4f} | {:<30} |".format(
+                        idx, g_mean, decomp_mean, d_mean, tw_str))
 
                     diag_results["per_layer"][f"layer_{idx}"] = {
                         "gate_mean": round(g_mean, 4),
@@ -612,19 +612,21 @@ def main() -> None:
                         "type_weights": [round(w, 4) for w in tw_avg],
                     }
 
-                logger.info("╠" + "═" * 7 + "╬" + "═" * 30 + "╬" + "═" * 30 + "╬" + "═" * 10 + "╬" + "═" * 33 + "╣")
-                
-                # Summary card inside
+                logger.info("+" + "-" * 7 + "+" + "-" * 14 + "+" + "-" * 14 + "+" + "-" * 12 + "+" + "-" * 32 + "+")
+
+                # Summary
                 g_mean_all = sum(all_gates) / len(all_gates)
                 d_mean_all = sum(all_divs) / len(all_divs)
                 gate_open_pct = sum(1 for g in all_gates if g > 0.5) / len(all_gates) * 100
-                
-                logger.info("║" + " SUMMARY STATISTICS ".center(114) + "║")
-                logger.info("╠" + "═" * 114 + "╣")
-                logger.info("║  • Gate Activity (Mean across layers) : {:<74} ║".format(f"{g_mean_all:.4f}"))
-                logger.info("║  • Diversity Loss (Mean)             : {:<74} ║".format(f"{d_mean_all:.4f}"))
-                logger.info("║  • Layers with Gate > 0.5            : {:<74} ║".format(f"{gate_open_pct:.1f}% ({sum(1 for g in all_gates if g > 0.5)}/{len(all_gates)})"))
-                logger.info("╚" + "═" * 114 + "╝")
+
+                logger.info("")
+                logger.info("DIAGNOSTIC SUMMARY (LongAttention v2)")
+                logger.info("  Gate Activity (Mean)   : %.4f", g_mean_all)
+                logger.info("  Diversity Loss (Mean)  : %.4f", d_mean_all)
+                logger.info("  Layers Gate > 0.5      : %.1f%% (%d/%d)",
+                            gate_open_pct,
+                            sum(1 for g in all_gates if g > 0.5),
+                            len(all_gates))
 
                 diag_results["summary"] = {
                     "gate_mean": round(g_mean_all, 4),
@@ -632,32 +634,43 @@ def main() -> None:
                     "layers_gate_over_0.5": f"{sum(1 for g in all_gates if g > 0.5)}/{len(all_gates)}",
                 }
 
-            # Save diagnostic report
+            elif args.attention_type == "led":
+                logger.info("LED attention: no per-layer gate diagnostics (standard sliding window).")
+
+            # Save diagnostic report JSON
             diag_path = Path(output_dir) / "diagnostic_report.json"
             with open(diag_path, "w") as f:
                 _json.dump(diag_results, f, indent=2)
-            logger.info("Diagnostic report saved → %s", diag_path)
+            logger.info("Diagnostic report saved -> %s", diag_path)
 
         except Exception as e:
-            logger.warning("Diagnostic report failed (non-critical): %s", e)
+            import traceback as _tb
+            logger.error("Diagnostic report FAILED:")
+            logger.error(_tb.format_exc())
 
-    logger.info("╔" + "═" * 58 + "╗")
-    logger.info("║" + " FINAL EXPERIMENT METRICS ".center(58) + "║")
-    logger.info("╠" + "═" * 38 + "╦" + "═" * 19 + "╣")
-    logger.info("║ {:<36} ║ {:<17} ║".format("Metric Name", "Value"))
-    logger.info("╠" + "═" * 38 + "╬" + "═" * 19 + "╣")
+    else:
+        logger.info("Attention type '%s' — no architectural diagnostics.", args.attention_type)
+
+    # ── Final Experiment Metrics (plain-text table) ──────────────────────────
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("FINAL EXPERIMENT METRICS")
+    logger.info("=" * 60)
+    logger.info("+" + "-" * 38 + "+" + "-" * 19 + "+")
+    logger.info("| {:<36} | {:>17} |".format("Metric", "Value"))
+    logger.info("+" + "-" * 38 + "+" + "-" * 19 + "+")
     for k, v in sorted(final_metrics.items()):
         if isinstance(v, float):
             v_str = f"{v:.4f}"
         else:
             v_str = str(v)
-        # Handle long strings or truncate to fit
-        if len(k) > 34:
-            k = k[:31] + "..."
-        if len(v_str) > 15:
-            v_str = v_str[:12] + "..."
-        logger.info("║ {:<36} ║ {:>17} ║".format(k, v_str))
-    logger.info("╚" + "═" * 38 + "╩" + "═" * 19 + "╝")
+        if len(k) > 36:
+            k = k[:33] + "..."
+        if len(v_str) > 17:
+            v_str = v_str[:14] + "..."
+        logger.info("| {:<36} | {:>17} |".format(k, v_str))
+    logger.info("+" + "-" * 38 + "+" + "-" * 19 + "+")
+    logger.info("")
 
 
 if __name__ == "__main__":
