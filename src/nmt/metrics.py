@@ -36,12 +36,21 @@ def _load_evaluate_metric(name: str):
         ) from exc
 
 
+# Global cache for heavy models to avoid redundant reloading
+_COMET_MODEL_CACHE: Dict[str, Any] = {}
+
+
 def _load_comet_model(model_name: str = "Unbabel/wmt22-comet-da"):
-    """Load a COMET model from unbabel-comet, with a clear error on missing deps."""
+    """Load a COMET model (cached globally so it's only loaded once per process)."""
+    if model_name in _COMET_MODEL_CACHE:
+        return _COMET_MODEL_CACHE[model_name]
     try:
         from comet import load_from_checkpoint, download_model
+        logger.info("Loading COMET model '%s' (first time, will be cached)...", model_name)
         checkpoint = download_model(model_name)
-        return load_from_checkpoint(checkpoint)
+        model = load_from_checkpoint(checkpoint)
+        _COMET_MODEL_CACHE[model_name] = model
+        return model
     except Exception as exc:
         raise ImportError(
             f"Could not load COMET model '{model_name}'. "
