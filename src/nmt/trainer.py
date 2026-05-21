@@ -150,12 +150,12 @@ class Seq2SeqDocumentDataset(Dataset):
         src_text: str = str(row["source"])
         tgt_text: str = str(row["target"])
 
-        # Tokenise source for encoder
+        # Tokenise source for encoder (dynamic padding will be done by data collator)
         source_enc = self.tokenizer(
             src_text,
             max_length=self.src_max_len,
             truncation=True,
-            padding="max_length",
+            padding=False,
         )
 
         # Tokenise target for decoder labels
@@ -163,14 +163,13 @@ class Seq2SeqDocumentDataset(Dataset):
             text_target=tgt_text,
             max_length=self.tgt_max_len,
             truncation=True,
-            padding="max_length",
+            padding=False,
         )
 
-        import numpy as np
         return {
-            "input_ids": torch.as_tensor(np.array(source_enc["input_ids"], dtype=np.int64)),
-            "attention_mask": torch.as_tensor(np.array(source_enc["attention_mask"], dtype=np.int64)),
-            "labels": torch.as_tensor(np.array(target_enc["input_ids"], dtype=np.int64)),
+            "input_ids": source_enc["input_ids"],
+            "attention_mask": source_enc["attention_mask"],
+            "labels": target_enc["input_ids"],
         }
 
 

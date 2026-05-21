@@ -297,13 +297,12 @@ class TranslationDataset(Dataset):
         src_text: str = str(row["source"])
         tgt_text: str = str(row["target"])
 
-        # Tokenise source
+        # Tokenise source (dynamic padding will be done by data collator)
         model_inputs = self.tokenizer(
             src_text,
             max_length=self.src_max_len,
-            padding="max_length",
+            padding=False,
             truncation=True,
-            return_tensors="pt",
         )
 
         # Tokenise target as labels
@@ -311,15 +310,12 @@ class TranslationDataset(Dataset):
             labels = self.tokenizer(
                 tgt_text,
                 max_length=self.tgt_max_len,
-                padding="max_length",
+                padding=False,
                 truncation=True,
-                return_tensors="pt",
             )
 
         model_inputs["labels"] = labels["input_ids"]
-
-        # Squeeze batch dimension added by return_tensors='pt'
-        return {k: v.squeeze(0) for k, v in model_inputs.items()}
+        return model_inputs
 
 
 def build_datasets(
