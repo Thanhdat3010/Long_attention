@@ -23,8 +23,8 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.data_preparation import download_and_cache_dataset
-from src.training.metrics import (
+from src.nmt.data_preparation import download_and_cache_dataset
+from src.nmt.metrics import (
     compute_sacrebleu,
     compute_chrf,
     compute_comet,
