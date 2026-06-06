@@ -475,14 +475,15 @@ def build_training_args(
     """
     effective_lr = learning_rate_override if learning_rate_override is not None else args.learning_rate
 
+    no_val = getattr(args, "no_val_during_train", False)
+
     # Build kwargs dynamically for version compatibility
     training_kwargs = {
         "output_dir": output_dir,
         "do_train": True,
-        "do_eval": True,
+        "do_eval": not no_val,
         "logging_strategy": "epoch",  # Revert to epoch to avoid JSON spam
-        "save_strategy": "epoch",
-        "eval_strategy": "epoch",
+        "save_strategy": "no" if no_val else "epoch",
         "predict_with_generate": True,
         "generation_max_length": getattr(args, 'max_target_length', 1024),
         "generation_num_beams": 4,     # Use beam search for higher translation quality
@@ -497,20 +498,20 @@ def build_training_args(
         "fp16": (args.dtype == "float16"),
         "bf16": (args.dtype == "bfloat16"),
         "seed": args.seed,
-        "load_best_model_at_end": True,
-        "metric_for_best_model": "eval_sacrebleu",
-        "greater_is_better": True,
+        "load_best_model_at_end": not no_val,
         "report_to": "tensorboard",
         "disable_tqdm": True, # Disable default TQDM to let our custom bar run smoothly
         "gradient_checkpointing": getattr(args, 'gradient_checkpointing', False),
     }
 
+    if not no_val:
+        training_kwargs["metric_for_best_model"] = "eval_sacrebleu"
+        training_kwargs["greater_is_better"] = True
+
     # Handle evaluation_strategy vs eval_strategy
     v_info = version.parse(transformers.__version__)
-    if v_info >= version.parse("4.41.0"):
-        training_kwargs["eval_strategy"] = "epoch"
-    else:
-        training_kwargs["evaluation_strategy"] = "epoch"
+    eval_strat_key = "eval_strategy" if v_info >= version.parse("4.41.0") else "evaluation_strategy"
+    training_kwargs[eval_strat_key] = "no" if no_val else "epoch"
 
     return Seq2SeqTrainingArguments(**training_kwargs)
 
@@ -551,21 +552,30 @@ def run_training(
         GateDiversityCallback
     )
 
+    no_val = getattr(args, "no_val_during_train", False)
+
     if is_spt:
         spt_mask_ratio = getattr(args, 'spt_mask_ratio', 0.15)
         logger.info("Configuring for Self Pre-training (SPT) — mask_ratio=%.2f...", spt_mask_ratio)
         collator = BARTDenoisingCollator(tokenizer, mask_ratio=spt_mask_ratio, max_length=args.max_source_length)
         training_args.predict_with_generate = False # Don't evaluate with BLEU during SPT
-        training_args.metric_for_best_model = "eval_loss" # Use loss for SPT
-        training_args.greater_is_better = False
+        if not no_val:
+            training_args.metric_for_best_model = "eval_loss" # Use loss for SPT
+            training_args.greater_is_better = False
+        else:
+            training_args.load_best_model_at_end = False
+            training_args.save_strategy = "no"
+            v_info = version.parse(transformers.__version__)
+            eval_strat_key = "eval_strategy" if v_info >= version.parse("4.41.0") else "evaluation_strategy"
+            setattr(training_args, eval_strat_key, "no")
         compute_metrics = None
-        eval_dataset_in_trainer = val_dataset
+        eval_dataset_in_trainer = None if no_val else val_dataset
     else:
         collator = DataCollatorForSeq2Seq(tokenizer, model=model)
         
         # --- Fast Eval Logic (Subset) ---
         val_subset_size = getattr(args, "max_val_samples_during_train", None)
-        if val_subset_size and val_subset_size < len(val_dataset):
+        if val_subset_size and val_subset_size < len(val_dataset) and not no_val:
             logger.info("Fast Eval: Slicing val_dataset to %d for intermediate steps.", val_subset_size)
             # Slice the dataframe and create a new dataset instance
             subset_df = val_dataset.data.iloc[:val_subset_size]
@@ -577,16 +587,19 @@ def run_training(
             )
             eval_dataset_in_trainer.data = subset_df
         else:
-            eval_dataset_in_trainer = val_dataset
+            eval_dataset_in_trainer = None if no_val else val_dataset
 
         # --- Fast Eval Logic (COMET Toggle) ---
         use_comet_during_train = getattr(args, "use_comet_during_train", False)
-        val_sources = eval_dataset_in_trainer.data["source"].tolist() if hasattr(eval_dataset_in_trainer, "data") else None
-        compute_metrics = make_compute_metrics(
-            tokenizer=tokenizer,
-            sources_for_comet=val_sources,
-            use_comet=use_comet_during_train and getattr(args, "use_comet", True),
-        )
+        if eval_dataset_in_trainer is not None:
+            val_sources = eval_dataset_in_trainer.data["source"].tolist() if hasattr(eval_dataset_in_trainer, "data") else None
+            compute_metrics = make_compute_metrics(
+                tokenizer=tokenizer,
+                sources_for_comet=val_sources,
+                use_comet=use_comet_during_train and getattr(args, "use_comet", True),
+            )
+        else:
+            compute_metrics = None
 
     # Callbacks
     progress_callback = SmoothProgressCallback()
@@ -594,9 +607,10 @@ def run_training(
         AttentionSinkCallback(output_dir=output_dir, log_to_file=True),
         GPUMemoryCallback(),
         CheckpointMetadataCallback(metadata=vars(args)),
-        EarlyStoppingCallback(early_stopping_patience=3),
         progress_callback,
     ]
+    if not no_val:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=3))
     if args.attention_type == "long_attention":
         callbacks.append(GateDiversityCallback(output_dir=output_dir, log_to_file=True))
 

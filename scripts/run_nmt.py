@@ -238,6 +238,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="Enable gradient checkpointing to trade compute for VRAM savings.",
     )
+    train_grp.add_argument(
+        "--no_val_during_train",
+        action="store_true",
+        default=False,
+        help="Disable validation and checkpoint selection during training epochs to save time.",
+    )
 
     # ── Output ───────────────────────────────────────────────────────────────
     out_grp = parser.add_argument_group("Output")
