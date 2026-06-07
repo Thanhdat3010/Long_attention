@@ -121,6 +121,8 @@ class AttentionSinkCallback(TrainerCallback):
     ) -> None:
         """Register hooks just before evaluation begins."""
         if model is not None:
+            self._orig_output_attentions = getattr(model.config, "output_attentions", False)
+            model.config.output_attentions = True
             self._register_hooks(model)
 
     def on_evaluate_end(
@@ -132,6 +134,9 @@ class AttentionSinkCallback(TrainerCallback):
     ) -> None:
         """Compute sink ratios and log results after evaluation."""
         self._remove_hooks()
+        model = kwargs.get("model", None)
+        if model is not None and hasattr(self, "_orig_output_attentions"):
+            model.config.output_attentions = self._orig_output_attentions
 
         if not self._captured_weights:
             logger.warning("AttentionSinkCallback: no attention weights captured.")

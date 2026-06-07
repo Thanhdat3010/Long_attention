@@ -152,7 +152,13 @@ def build_long_attention_model(
             state_dict = load_file(os.path.join(backbone, "model.safetensors"), device="cpu")
         else:
             state_dict = torch.load(os.path.join(backbone, "pytorch_model.bin"), map_location="cpu")
-        model.load_state_dict(state_dict, strict=True)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        tied_keys = {"model.encoder.embed_tokens.weight", "model.decoder.embed_tokens.weight", "lm_head.weight", "model.shared.weight"}
+        actual_missing = [k for k in missing_keys if k not in tied_keys]
+        if actual_missing:
+            raise RuntimeError(f"Missing non-tied keys in state_dict: {actual_missing}")
+        if unexpected_keys:
+            raise RuntimeError(f"Unexpected keys in state_dict: {unexpected_keys}")
 
     if freeze_backbone:
         logger.info("Freezing backbone — only Injected layers will be trained.")
