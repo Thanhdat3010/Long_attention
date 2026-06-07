@@ -63,7 +63,9 @@ class SmoothProgressCallback(TrainerCallback):
         self.eval_pbar = None
 
     def on_train_begin(self, args, state, control, **kwargs):
-        is_spt = getattr(args, "metric_for_best_model", "") == "eval_loss"
+        is_spt = False
+        if self.trainer is not None:
+            is_spt = getattr(self.trainer, "is_spt", False)
         stage_name = "Stage 1 (SPT)" if is_spt else "Stage 2 (Fine-Tuning)"
         
         self.pbar = tqdm(total=state.max_steps, desc=stage_name, dynamic_ncols=True, leave=True)
@@ -628,6 +630,7 @@ def run_training(
     )
     
     # Assign trainer reference to custom progress callback for real-time loss tracking
+    trainer.is_spt = is_spt
     progress_callback.trainer = trainer
 
     # ------ Train ------
