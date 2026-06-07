@@ -164,6 +164,21 @@ def build_led_model(
     model.tie_weights()
     logger.info("Weight tying re-established (embed_tokens + lm_head).")
 
+    # Load checkpoint weights if loading from a saved model checkpoint
+    import os
+    is_checkpoint = os.path.isdir(backbone) and (
+        os.path.exists(os.path.join(backbone, "pytorch_model.bin")) or
+        os.path.exists(os.path.join(backbone, "model.safetensors"))
+    )
+    if is_checkpoint:
+        logger.info("Loading saved checkpoint weights from: %s", backbone)
+        if os.path.exists(os.path.join(backbone, "model.safetensors")):
+            from safetensors.torch import load_file
+            state_dict = load_file(os.path.join(backbone, "model.safetensors"), device="cpu")
+        else:
+            state_dict = torch.load(os.path.join(backbone, "pytorch_model.bin"), map_location="cpu")
+        model.load_state_dict(state_dict, strict=True)
+
     # ── Optional backbone freeze ────────────────────────────────────────
     if freeze_backbone:
         logger.info("Freezing base model parameters. Only training LED attention modules.")

@@ -148,7 +148,29 @@ def main() -> None:
         sys.exit(1)
 
     logger.info("Loading checkpoint from: %s", checkpoint_dir)
-    from transformers import AutoTokenizer, BartForConditionalGeneration
+    from transformers import AutoTokenizer
+    from src.models import build_model
+
+    # Load args.json from checkpoint to reconstruct the exact model parameters
+    args_json_path = checkpoint_dir / "args.json"
+    attention_type = "vanilla"
+    long_attention_config = None
+    if args_json_path.is_file():
+        try:
+            with open(args_json_path, "r", encoding="utf-8") as f:
+                saved_args = json.load(f)
+                attention_type = saved_args.get("attention_type", "vanilla")
+                long_attention_config = {
+                    "local_window_size": saved_args.get("local_window_size", 512),
+                    "top_k": saved_args.get("top_k", 64),
+                    "num_types": saved_args.get("num_types", 3),
+                    "bottleneck_ratio": saved_args.get("bottleneck_ratio", 0.25),
+                    "dropout_prob": saved_args.get("dropout_prob", 0.1),
+                    "max_length": max(saved_args.get("max_source_length", 1024), saved_args.get("max_target_length", 1024)),
+                }
+                logger.info("Reconstructed config from args.json: attention_type=%s", attention_type)
+        except Exception as e:
+            logger.warning("Could not read args.json from checkpoint directory: %s. Using default attention_type.", e)
 
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
@@ -156,10 +178,13 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir))
 
     device_map = args.device if args.device != "auto" else "auto"
-    model = BartForConditionalGeneration.from_pretrained(
-        str(checkpoint_dir),
-        torch_dtype=torch_dtype,
+    model = build_model(
+        task="nmt",
+        backbone=str(checkpoint_dir),
         device_map=device_map,
+        torch_dtype=torch_dtype,
+        attention_type=attention_type,
+        long_attention_config=long_attention_config,
     )
 
     if args.device == "auto":

@@ -139,6 +139,21 @@ def build_long_attention_model(
     # Re-establish weight tying (embed_tokens + lm_head) to prevent missing keys
     model.tie_weights()
     
+    # Load checkpoint weights if loading from a saved model checkpoint
+    import os
+    is_checkpoint = os.path.isdir(backbone) and (
+        os.path.exists(os.path.join(backbone, "pytorch_model.bin")) or
+        os.path.exists(os.path.join(backbone, "model.safetensors"))
+    )
+    if is_checkpoint:
+        logger.info("Loading saved checkpoint weights from: %s", backbone)
+        if os.path.exists(os.path.join(backbone, "model.safetensors")):
+            from safetensors.torch import load_file
+            state_dict = load_file(os.path.join(backbone, "model.safetensors"), device="cpu")
+        else:
+            state_dict = torch.load(os.path.join(backbone, "pytorch_model.bin"), map_location="cpu")
+        model.load_state_dict(state_dict, strict=True)
+
     if freeze_backbone:
         logger.info("Freezing backbone — only Injected layers will be trained.")
         for name, param in model.named_parameters():
