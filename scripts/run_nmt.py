@@ -560,9 +560,12 @@ def main() -> None:
                             if isinstance(out, tuple) and len(out) == 2:
                                 layer_div_losses.setdefault(layer_id, []).append(out[1].item())
                             # Capture type mixer weights from input
-                            hidden = inp[0]  # hidden_states
-                            tw = torch.nn.functional.softmax(module.type_mixer(hidden), dim=-1)
-                            layer_type_weights.setdefault(layer_id, []).append(tw.mean(dim=(0, 1)).detach().cpu().tolist())
+                            if len(inp) > 0:
+                                hidden = inp[0]  # hidden_states
+                                tw = torch.nn.functional.softmax(module.type_mixer(hidden), dim=-1)
+                                layer_type_weights.setdefault(layer_id, []).append(tw.mean(dim=(0, 1)).detach().cpu().tolist())
+                            else:
+                                logger.warning(f"TypedTopKRetrieval hook got empty input tuple at layer {layer_id}")
                         return hook
                     hooks.append(attn.typed_retrieval.register_forward_hook(make_retrieval_hook(idx)))
 

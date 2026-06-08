@@ -348,10 +348,10 @@ class LongAttention(nn.Module):
         
         # 4. Typed Retrieval
         A_long, diversity_loss = self.typed_retrieval(
-            hidden_states=hidden_states, 
-            K_typed=K_typed, 
-            V_typed=V_typed, 
-            attention_mask=attention_mask
+            hidden_states, 
+            K_typed, 
+            V_typed, 
+            attention_mask
         )
         self.last_diversity_loss = diversity_loss # Keep as tensor for backprop
         
