@@ -122,8 +122,18 @@ class AttentionSinkCallback(TrainerCallback):
         """Register hooks just before evaluation begins."""
         if model is not None:
             self._orig_output_attentions = getattr(model.config, "output_attentions", False)
-            model.config.output_attentions = True
-            self._register_hooks(model)
+            self._orig_attn_implementation = getattr(model.config, "_attn_implementation", "eager")
+            try:
+                model.config.output_attentions = True
+                self._register_hooks(model)
+            except ValueError as e:
+                if "sdpa" in str(e).lower():
+                    # Temporarily downgrade to eager attention implementation to support output_attentions
+                    model.config._attn_implementation = "eager"
+                    model.config.output_attentions = True
+                    self._register_hooks(model)
+                else:
+                    raise e
 
     def on_evaluate_end(
         self,
@@ -135,8 +145,11 @@ class AttentionSinkCallback(TrainerCallback):
         """Compute sink ratios and log results after evaluation."""
         self._remove_hooks()
         model = kwargs.get("model", None)
-        if model is not None and hasattr(self, "_orig_output_attentions"):
-            model.config.output_attentions = self._orig_output_attentions
+        if model is not None:
+            if hasattr(self, "_orig_output_attentions"):
+                model.config.output_attentions = self._orig_output_attentions
+            if hasattr(self, "_orig_attn_implementation"):
+                model.config._attn_implementation = self._orig_attn_implementation
 
         if not self._captured_weights:
             logger.warning("AttentionSinkCallback: no attention weights captured.")

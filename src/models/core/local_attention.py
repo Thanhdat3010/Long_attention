@@ -162,9 +162,9 @@ class LocalSlidingWindowAttention(nn.Module):
         if full_mask is not None:
             full_mask = full_mask.to(dtype=hidden_states.dtype)
 
-        # 2. Use F.scaled_dot_product_attention (SDPA) if on PyTorch 2.0+
+        # 2. Use F.scaled_dot_product_attention (SDPA) if on PyTorch 2.0+ and output_attentions is False
         # This is much faster than manual MatMul + Softmax
-        if hasattr(F, "scaled_dot_product_attention"):
+        if hasattr(F, "scaled_dot_product_attention") and not output_attentions:
             # Note: SDPA handles scaling and dropout internally
             context = F.scaled_dot_product_attention(
                 Q, K, V, 
