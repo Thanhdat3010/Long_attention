@@ -180,8 +180,7 @@ class DependencyTypedGist(nn.Module):
         count = 0
         for i in range(self.num_types):
             for j in range(i + 1, self.num_types):
-                cos_sim = F.cosine_similarity(type_weights[i].unsqueeze(0), 
-                                               type_weights[j].unsqueeze(0))
+                cos_sim = F.cosine_similarity(type_weights[i], type_weights[j], dim=0)
                 loss = loss + cos_sim.abs()  # Penalize both positive and negative similarity
                 count += 1
         
@@ -304,8 +303,7 @@ class TypedTopKRetrieval(nn.Module):
         count = 0
         for i in range(self.num_types):
             for j in range(i + 1, self.num_types):
-                cos_sim = F.cosine_similarity(type_weights[i].unsqueeze(0),
-                                               type_weights[j].unsqueeze(0))
+                cos_sim = F.cosine_similarity(type_weights[i], type_weights[j], dim=0)
                 loss = loss + cos_sim.abs()
                 count += 1
         
