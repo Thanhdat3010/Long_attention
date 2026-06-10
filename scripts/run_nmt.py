@@ -484,6 +484,14 @@ def main() -> None:
         )
         # Restore epochs for Stage 2
         args.epochs = original_epochs
+        
+        # Free up memory (GC + CUDA Cache) from Stage 1 before beginning Stage 2
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         logger.info("SPT completed. Model calibrated. Moving to Stage 2.")
     else:
         logger.info("[5/6] Skipping Stage 1 (SPT).")
