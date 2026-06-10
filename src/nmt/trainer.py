@@ -649,6 +649,21 @@ def run_training(
 
     # ------ Train ------
     logger.info("Starting %s training...", "SPT" if is_spt else "Fine-tuning")
+    
+    # Diagnostic: log RAM and VRAM availability
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        logger.info(f"[Diagnostic] System RAM: Total={mem.total/(1024**3):.2f}GB, Available={mem.available/(1024**3):.2f}GB, Used={mem.used/(1024**3):.2f}GB ({mem.percent}%)")
+    except Exception as e:
+        logger.info(f"[Diagnostic] Could not check system RAM: {e}")
+    if torch.cuda.is_available():
+        for device_idx in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(device_idx) / (1024**3)
+            reserved = torch.cuda.memory_reserved(device_idx) / (1024**3)
+            total = torch.cuda.get_device_properties(device_idx).total_memory / (1024**3)
+            logger.info(f"[Diagnostic] GPU {device_idx}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, Total={total:.2f}GB")
+
     train_result = trainer.train()
     trainer.log_metrics("train", train_result.metrics)
     trainer.save_metrics("train", train_result.metrics)
