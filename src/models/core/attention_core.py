@@ -1,12 +1,12 @@
 """
-LongAttention v2: Necessity-Aware & Dependency-Typed Long-Context Attention.
+LongAttention v3: Necessity-Aware & Dependency-Typed Long-Context Attention.
 
-This module implements the core architectural contribution of the LongAttention v2 proposal.
+This module implements the core architectural contribution of the LongAttention v3 proposal.
 It integrates two parallel branches:
 
   Branch 1 — Local Branch (LocalSlidingWindowAttention):
       Dense attention over a short sliding window to capture syntactic structure
-      and immediate coherence.
+      and immediate coherence. Enhanced with Functional Affix information.
 
   Branch 2 — Gated & Typed Long-range Branch:
       1. Necessity Gating (g_i): Decides IF long-range information is needed.
@@ -16,6 +16,17 @@ It integrates two parallel branches:
          - Lexical Consistency
          - Discourse Relations
       4. Top-K Retrieval: Efficiently routes to the most relevant context segments.
+
+  Output Integration — Gated Interpolation:
+      combined = (1 - g_i) * (A_local + A_affix) + g_i * A_long
+
+Changes in v3 (from v2):
+  - A_encoded (Affix) is now integrated into the local branch instead of being discarded.
+  - Query for long-range retrieval is projected from R_encoded (not raw hidden_states),
+    ensuring Q and K share the same semantic feature space.
+  - Diversity loss replaced with Static Orthogonality Regularization on projection weights,
+    eliminating torch.randperm GPU bottleneck.
+  - Branch merging uses Gated Interpolation for balanced activation magnitudes.
 """
 
 import math
@@ -115,6 +126,7 @@ class DependencyTypedGist(nn.Module):
     def __init__(self, hidden_size: int, num_types: int = 3):
         super().__init__()
         self.num_types = num_types
+        self.hidden_size = hidden_size
         # Consolidated projection for all types, Keys, and Values: 
         # (hidden_size * 2 for K and V, multiplied by num_types)
         self.multi_type_proj = nn.Linear(hidden_size, hidden_size * 2 * num_types, bias=True)
@@ -139,6 +151,41 @@ class DependencyTypedGist(nn.Module):
         V_typed = kv_all[:, :, :, 1, :].transpose(1, 2)
         
         return K_typed, V_typed
+
+    def compute_orthogonality_loss(self) -> torch.Tensor:
+        """
+        Static Orthogonality Regularization on projection weight matrices.
+        
+        Penalizes cosine similarity between the projection weights of different
+        dependency types to encourage each type to learn distinct representations.
+        This replaces the dynamic TV-Distance diversity loss that caused GPU bottleneck.
+        
+        No torch.randperm, no CPU-GPU sync — pure static weight computation.
+        """
+        D = self.hidden_size
+        # multi_type_proj.weight shape: (num_types * 2 * D, D)
+        # Each type has 2*D rows (D for K, D for V)
+        W = self.multi_type_proj.weight  # (num_types * 2D, D)
+        chunk_size = 2 * D
+        
+        # Split into per-type weight matrices
+        type_weights = []
+        for t in range(self.num_types):
+            # Each type's full projection: (2D, D) — flatten to a single vector for comparison
+            w_t = W[t * chunk_size : (t + 1) * chunk_size]  # (2D, D)
+            type_weights.append(w_t.reshape(-1))  # (2D*D,)
+        
+        # Compute pairwise cosine similarity penalty
+        loss = torch.tensor(0.0, device=W.device, dtype=W.dtype)
+        count = 0
+        for i in range(self.num_types):
+            for j in range(i + 1, self.num_types):
+                cos_sim = F.cosine_similarity(type_weights[i].unsqueeze(0), 
+                                               type_weights[j].unsqueeze(0))
+                loss = loss + cos_sim.abs()  # Penalize both positive and negative similarity
+                count += 1
+        
+        return loss / max(count, 1)
 
 
 class TypedTopKRetrieval(nn.Module):
@@ -171,25 +218,30 @@ class TypedTopKRetrieval(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        query_states: torch.Tensor,
         K_typed: torch.Tensor,
         V_typed: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Args:
+            query_states: (B, T, D) - R_encoded (v3: aligned with K space)
+            K_typed: (B, num_types, T, D)
+            V_typed: (B, num_types, T, D)
+            
         Returns:
             A_long: (B, T, D) - Aggregated long-range output
-            diversity_loss: Scalar - Regularization to ensure types don't collapse
+            orthogonality_loss: Scalar - Static regularization (always 0 in forward; computed separately)
         """
-        B, T, D = hidden_states.shape
+        B, T, D = query_states.shape
         effective_k = min(self.top_k, T)
         
-        # 1. Compute Type Mixing Weights
-        type_weights = F.softmax(self.type_mixer(hidden_states), dim=-1) # (B, T, num_types)
+        # 1. Compute Type Mixing Weights (from query_states which is R_encoded)
+        type_weights = F.softmax(self.type_mixer(query_states), dim=-1) # (B, T, num_types)
         
         # 2. Parallel Retrieval for all types (Vectorized Forward Pass)
         # Project all queries at once: (B, T, num_types * D)
-        Q_all = self.q_proj(hidden_states)
+        Q_all = self.q_proj(query_states)
         
         # Reshape Q: (B, T, num_types, H, d_k) -> permute -> (B, num_types, H, T, d_k)
         Q = Q_all.view(B, T, self.num_types, self.num_heads, self.head_dim).permute(0, 2, 3, 1, 4)
@@ -219,39 +271,60 @@ class TypedTopKRetrieval(nn.Module):
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         
-        # 3. Compute Diversity Loss (Optimized via Sampling)
-        # TV distance: 0.5 * sum|p - q|, constant gradient magnitude via sign()
-        diversity_loss = torch.tensor(0.0, device=hidden_states.device)
-        if self.num_types > 1 and self.training:
-            num_samples = min(128, T)
-            indices = torch.randperm(T, device=hidden_states.device)[:num_samples]
-            
-            # sampled_weights: (B, num_types, num_samples, T)
-            sampled_weights = attn_weights[:, :, :, indices, :].mean(dim=2)
-            
-            # Use Absolute Difference (TV Distance) for constant "push" force
-            diffs = sampled_weights.unsqueeze(2) - sampled_weights.unsqueeze(1)
-            tv_dist = 0.5 * torch.abs(diffs).sum(dim=-1).mean(dim=(0, 3))
-            idx0, idx1 = torch.triu_indices(self.num_types, self.num_types, offset=1)
-            diversity_loss = (1.0 - tv_dist[idx0, idx1]).sum()
+        # v3: No dynamic diversity loss computation here — orthogonality loss is static
+        # and computed via compute_orthogonality_loss() on weight matrices.
 
-        # 4. Context Aggregation
+        # 3. Context Aggregation
         out = torch.matmul(self.attn_dropout(attn_weights), V) 
         out = out.permute(0, 3, 1, 2, 4).reshape(B, T, self.num_types, D)
 
-        # 5. Combine outputs via weights: O = sum_t w_t * O_t
+        # 4. Combine outputs via weights: O = sum_t w_t * O_t
         A_long = (out * type_weights.unsqueeze(-1)).sum(dim=-2) # (B, T, D)
         
-        return A_long, diversity_loss
+        return A_long
+
+    def compute_orthogonality_loss(self) -> torch.Tensor:
+        """
+        Static Orthogonality Regularization on Q projection weight matrices.
+        
+        Penalizes cosine similarity between the query projection weights of different
+        dependency types. Combined with DependencyTypedGist's orthogonality loss.
+        """
+        D = self.hidden_size
+        W = self.q_proj.weight  # (num_types * D, D)
+        
+        # Split into per-type weight matrices
+        type_weights = []
+        for t in range(self.num_types):
+            w_t = W[t * D : (t + 1) * D]  # (D, D)
+            type_weights.append(w_t.reshape(-1))  # (D*D,)
+        
+        # Compute pairwise cosine similarity penalty
+        loss = torch.tensor(0.0, device=W.device, dtype=W.dtype)
+        count = 0
+        for i in range(self.num_types):
+            for j in range(i + 1, self.num_types):
+                cos_sim = F.cosine_similarity(type_weights[i].unsqueeze(0),
+                                               type_weights[j].unsqueeze(0))
+                loss = loss + cos_sim.abs()
+                count += 1
+        
+        return loss / max(count, 1)
 
 
 # ---------------------------------------------------------------------------
-# LongAttention v2: Main Module
+# LongAttention v3: Main Module
 # ---------------------------------------------------------------------------
 
 class LongAttention(nn.Module):
     """
-    LongAttention v2: Necessity-aware, Dependency-typed Attention.
+    LongAttention v3: Necessity-aware, Dependency-typed Attention.
+    
+    v3 improvements over v2:
+      - Affix integration into local branch
+      - Q/K space alignment (query from R_encoded)
+      - Static orthogonality regularization (no GPU bottleneck)
+      - Gated interpolation for branch merging
     """
 
     def __init__(
@@ -305,6 +378,14 @@ class LongAttention(nn.Module):
         self.last_gate_val = 0.0
         self.last_diversity_loss = 0.0
 
+    def compute_orthogonality_loss(self) -> torch.Tensor:
+        """
+        Aggregate static orthogonality loss from both typed_gist and typed_retrieval.
+        This replaces the dynamic diversity loss from v2.
+        """
+        return (self.typed_gist.compute_orthogonality_loss() + 
+                self.typed_retrieval.compute_orthogonality_loss()) * 0.5
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -334,40 +415,44 @@ class LongAttention(nn.Module):
         g_i = self.necessity_gate(hidden_states) # (B, T, 1)
         self.last_gate_val = g_i.mean() # Keep as tensor for backprop/logging
 
-        # 2. Decompose Gist
+        # 2. Decompose: S -> R (Semantic Root) + A (Functional Affix)
         global_ctx = hidden_states.mean(dim=1, keepdim=True)
-        decomp_outputs = self.decomposer(hidden_states, global_ctx)
-        
-        # Internal modules like Decomposer should return consistent 3-tuples or we handle versioning
-        # FunctionalDecomposer.forward returns 3 values currently, let's keep it safe.
-        R_encoded, A_encoded, _ = decomp_outputs
+        R_encoded, A_encoded, _ = self.decomposer(hidden_states, global_ctx)
         
         # 3. Build Typed Gists (K_t, V_t) — Only from Semantic Roots
         # Per Proposal: only semantically important tokens enter long-range memory
         K_typed, V_typed = self.typed_gist(R_encoded)
         
-        # 4. Typed Retrieval
-        A_long, diversity_loss = self.typed_retrieval(
-            hidden_states, 
+        # 4. Typed Retrieval — v3: Query from R_encoded (aligned Q/K space)
+        A_long = self.typed_retrieval(
+            R_encoded,   # v3: Query from decomposed semantic roots (not raw hidden_states)
             K_typed, 
             V_typed, 
             attention_mask
         )
-        self.last_diversity_loss = diversity_loss # Keep as tensor for backprop
         
-        # ── Output Integration ──
-        # Formula: O = OutProj( LocalContext + g_i * LongContext )
-        combined_context = A_local + g_i * A_long
+        # v3: Static orthogonality loss (computed from weights, not attention distributions)
+        if self.training:
+            ortho_loss = self.compute_orthogonality_loss()
+            self.last_diversity_loss = ortho_loss
+        else:
+            self.last_diversity_loss = torch.tensor(0.0, device=hidden_states.device)
+        
+        # ── Output Integration (v3: Gated Interpolation with Affix) ──
+        # A_encoded enriches local branch with syntactic/grammatical information
+        A_local_combined = A_local + A_encoded
+        
+        # Gated Interpolation: balanced branch merging
+        # Formula: O = OutProj( (1 - g_i) * LocalCombined + g_i * LongContext )
+        combined_context = (1.0 - g_i) * A_local_combined + g_i * A_long
         output = self.out_proj(combined_context)
         
         # Track metric for research analysis / Trainer logging
         self.last_gate_val = g_i.mean() 
-        self.last_diversity_loss = diversity_loss 
         
         # Hook for trainer to collect losses (used in metrics and callbacks)
-        # We attach these as attributes to the output tensor so the trainer can find them
         if self.training:
-            output.diversity_loss = diversity_loss
+            output.diversity_loss = self.last_diversity_loss
             output.gate_val = g_i.mean()
             
         if TRANSFORMERS_NEW_SIG:

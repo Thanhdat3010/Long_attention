@@ -92,14 +92,17 @@ class RobertaLongAttentionForQA(RobertaPreTrainedModel):
                 new_attn.local_attention.k_proj.bias.copy_(orig_attn.key.bias)
                 new_attn.local_attention.v_proj.bias.copy_(orig_attn.value.bias)
 
-                # Typed weights inheritance with noise
-                new_attn.typed_retrieval.q_proj.weight.copy_(orig_attn.query.weight.repeat(num_types, 1))
-                new_attn.typed_retrieval.q_proj.weight.data += torch.randn_like(new_attn.typed_retrieval.q_proj.weight.data) * 2e-2
+                # Typed weights inheritance with ASSB noise (v3)
+                q_w = new_attn.typed_retrieval.q_proj.weight
+                q_w.copy_(orig_attn.query.weight.repeat(num_types, 1))
+                orig_q_std = orig_attn.query.weight.std().item()
+                q_w.data += torch.randn_like(q_w.data) * (orig_q_std * 0.1)
                 
                 kv_w = new_attn.typed_gist.multi_type_proj.weight
                 kv_template_w = torch.cat([orig_attn.key.weight, orig_attn.value.weight], dim=0)
                 kv_w.copy_(kv_template_w.repeat(num_types, 1))
-                kv_w.data += torch.randn_like(kv_w.data) * 2e-2
+                orig_kv_std = kv_template_w.std().item()
+                kv_w.data += torch.randn_like(kv_w.data) * (orig_kv_std * 0.1)
                 
                 new_attn.out_proj.weight.copy_(layer.attention.output.dense.weight)
                 new_attn.out_proj.bias.copy_(layer.attention.output.dense.bias)
@@ -160,7 +163,11 @@ class RobertaLongAttentionForQA(RobertaPreTrainedModel):
         div_loss, g_val, cnt = 0.0, 0.0, 0
         for layer in self.roberta.encoder.layer:
             attn = layer.attention.self.attn
-            if hasattr(attn, 'last_diversity_loss'):
+            if hasattr(attn, 'compute_orthogonality_loss'):
+                div_loss += attn.compute_orthogonality_loss()
+                g_val += attn.last_gate_val
+                cnt += 1
+            elif hasattr(attn, 'last_diversity_loss'):
                 div_loss += attn.last_diversity_loss
                 g_val += attn.last_gate_val
                 cnt += 1

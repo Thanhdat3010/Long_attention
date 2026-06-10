@@ -124,7 +124,11 @@ def main():
             
             def make_retrieval_hook(layer_id):
                 def hook(module, inp, out):
-                    if isinstance(out, tuple) and len(out) == 2:
+                    # v3: forward returns single tensor, ortho loss is static
+                    if hasattr(module, 'compute_orthogonality_loss'):
+                        ortho = module.compute_orthogonality_loss()
+                        layer_div_losses.setdefault(layer_id, []).append(ortho.item())
+                    elif isinstance(out, tuple) and len(out) == 2:
                         layer_div_losses.setdefault(layer_id, []).append(out[1].item())
                     if len(inp) > 0:
                         hidden = inp[0]
@@ -187,7 +191,7 @@ def main():
         d_mean_all = sum(all_divs) / len(all_divs)
         gate_open_pct = sum(1 for g in all_gates if g > 0.5) / len(all_gates) * 100
         
-        print("\nDIAGNOSTIC SUMMARY (LongAttention v2)")
+        print("\nDIAGNOSTIC SUMMARY (LongAttention v3)")
         print(f"  Gate Activity (Mean)   : {g_mean_all:.4f}")
         print(f"  Diversity Loss (Mean)  : {d_mean_all:.4f}")
         print(f"  Layers Gate > 0.5      : {gate_open_pct:.1f}% ({sum(1 for g in all_gates if g > 0.5)}/{len(all_gates)})")

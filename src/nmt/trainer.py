@@ -395,14 +395,18 @@ class LongAttentionTrainer(Seq2SeqTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
-        Compute standard Seq2Seq loss + LongAttention research losses.
+        Compute standard Seq2Seq loss + LongAttention v3 research losses.
+        
+        v3 changes: Orthogonality loss is computed statically on weight matrices
+        via compute_orthogonality_loss(), replacing the dynamic TV-Distance
+        diversity loss that caused GPU bottleneck.
         """
         outputs = model(**inputs)
         # Standard CrossEntropy loss
         loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
         
         # Collect Research Losses from layers (Find dynamically but fast)
-        diversity_loss = torch.tensor(0.0, device=loss.device)
+        ortho_loss = torch.tensor(0.0, device=loss.device)
         gate_val = torch.tensor(0.0, device=loss.device)
         count = 0
         
@@ -416,24 +420,34 @@ class LongAttentionTrainer(Seq2SeqTrainer):
         if hasattr(base_model, "model") and hasattr(base_model.model, "encoder"):
             for layer in base_model.model.encoder.layers:
                 module = layer.self_attn
-                if hasattr(module, 'last_diversity_loss'):
-                    diversity_loss += module.last_diversity_loss
+                if hasattr(module, 'compute_orthogonality_loss'):
+                    # v3: Static orthogonality loss on weight matrices
+                    ortho_loss += module.compute_orthogonality_loss()
+                    gate_val += module.last_gate_val
+                    count += 1
+                elif hasattr(module, 'last_diversity_loss'):
+                    # v2 fallback: dynamic diversity loss
+                    ortho_loss += module.last_diversity_loss
                     gate_val += module.last_gate_val
                     count += 1
         else:
             # Fallback to general but slower search if architecture is unexpected
             for module in model.modules():
-                if hasattr(module, 'last_diversity_loss'):
-                    diversity_loss += module.last_diversity_loss
+                if hasattr(module, 'compute_orthogonality_loss'):
+                    ortho_loss += module.compute_orthogonality_loss()
+                    gate_val += module.last_gate_val
+                    count += 1
+                elif hasattr(module, 'last_diversity_loss'):
+                    ortho_loss += module.last_diversity_loss
                     gate_val += module.last_gate_val
                     count += 1
         
         if count > 0:
-            diversity_loss /= count
+            ortho_loss /= count
             gate_val /= count
             
-            # 1. Diversity Loss: Encourage types to stay separate
-            loss += self.diversity_weight * diversity_loss
+            # 1. Orthogonality Loss: Encourage dependency types to stay separate
+            loss += self.diversity_weight * ortho_loss
             
             # 2. Null-Route Calibration (Dynamic Warmup over 0.5 epoch)
             # Gate starts at ~0.27 (bias=-1.0), warmup lets long-range branch learn before penalizing
@@ -449,10 +463,10 @@ class LongAttentionTrainer(Seq2SeqTrainer):
             loss += effective_null_weight * gate_val
             
             self.latest_gate_val = gate_val.item()
-            self.latest_diversity_loss = diversity_loss.item()
+            self.latest_diversity_loss = ortho_loss.item()
             
             if self.state.global_step % 50 == 0:
-                logger.debug(f"Step {self.state.global_step} | DivLoss: {diversity_loss:.4f} | GateVal: {gate_val:.4f}")
+                logger.debug(f"Step {self.state.global_step} | OrthoLoss: {ortho_loss:.4f} | GateVal: {gate_val:.4f}")
 
         self.latest_loss = loss.item() if isinstance(loss, torch.Tensor) else loss
         return (loss, outputs) if return_outputs else loss

@@ -1,5 +1,5 @@
 """
-LongAttention v2 Model Builder: Load BART and inject LongAttention with proper weight inheritance.
+LongAttention v3 Model Builder: Load BART and inject LongAttention with proper weight inheritance.
 """
 
 import logging

@@ -554,14 +554,20 @@ def main() -> None:
                         return hook
                     hooks.append(attn.decomposer.register_forward_hook(make_decomp_hook(idx)))
 
-                    # Hook on typed retrieval for type_weights and diversity_loss
+                    # Hook on typed retrieval for type_weights and ortho loss (v3)
                     def make_retrieval_hook(layer_id):
                         def hook(module, inp, out):
-                            if isinstance(out, tuple) and len(out) == 2:
+                            # v3: forward returns single tensor A_long, ortho loss is static
+                            # Compute ortho loss from weight matrices
+                            if hasattr(module, 'compute_orthogonality_loss'):
+                                ortho = module.compute_orthogonality_loss()
+                                layer_div_losses.setdefault(layer_id, []).append(ortho.item())
+                            elif isinstance(out, tuple) and len(out) == 2:
+                                # v2 fallback
                                 layer_div_losses.setdefault(layer_id, []).append(out[1].item())
                             # Capture type mixer weights from input
                             if len(inp) > 0:
-                                hidden = inp[0]  # hidden_states
+                                hidden = inp[0]  # query_states (R_encoded in v3)
                                 tw = torch.nn.functional.softmax(module.type_mixer(hidden), dim=-1)
                                 layer_type_weights.setdefault(layer_id, []).append(tw.mean(dim=(0, 1)).detach().cpu().tolist())
                             else:
@@ -629,7 +635,7 @@ def main() -> None:
                 gate_open_pct = sum(1 for g in all_gates if g > 0.5) / len(all_gates) * 100
 
                 logger.info("")
-                logger.info("DIAGNOSTIC SUMMARY (LongAttention v2)")
+                logger.info("DIAGNOSTIC SUMMARY (LongAttention v3)")
                 logger.info("  Gate Activity (Mean)   : %.4f", g_mean_all)
                 logger.info("  Diversity Loss (Mean)  : %.4f", d_mean_all)
                 logger.info("  Layers Gate > 0.5      : %.1f%% (%d/%d)",
