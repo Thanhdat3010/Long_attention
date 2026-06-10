@@ -485,14 +485,25 @@ def main() -> None:
         # Restore epochs for Stage 2
         args.epochs = original_epochs
         
-        # Free up memory (GC + CUDA Cache) from Stage 1 before beginning Stage 2
+        # Free up memory (GC + CUDA Cache) by deleting model and re-loading it from SPT checkpoint
+        del model
         import gc
         import torch
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        logger.info("SPT completed. Model calibrated. Moving to Stage 2.")
+        logger.info("SPT completed. Re-loading calibrated model from: %s", spt_output_dir)
+        model = build_model(
+            task="nmt",
+            backbone=spt_output_dir,
+            device_map=args.device_map,
+            torch_dtype=args.dtype,
+            attention_type=args.attention_type,
+            long_attention_config=long_attention_config,
+            freeze_backbone=args.freeze_backbone,
+        )
+        logger.info("Moving to Stage 2: Fine-tuning.")
     else:
         logger.info("[5/6] Skipping Stage 1 (SPT).")
 
