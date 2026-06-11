@@ -430,6 +430,9 @@ def main() -> None:
     if args.freeze_backbone and args.attention_type != "vanilla":
         logger.info("Freezing backbone — only Injected layers will be trained.")
 
+    # Save model artifacts (args.json) early so they are on disk even if the run is killed during later evaluation phases
+    save_model_artifacts(model, tokenizer, output_dir=output_dir, args=args)
+
     # ── Step 4: Datasets ──────────────────────────────────────────────────────
     logger.info("[4/5] Building PyTorch datasets…")
     train_ds = Seq2SeqDocumentDataset(

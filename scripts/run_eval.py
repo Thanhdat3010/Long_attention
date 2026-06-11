@@ -87,6 +87,25 @@ def build_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dtype", type=str, choices=["float16", "bfloat16", "float32"], default="float32"
     )
+    parser.add_argument(
+        "--attention_type", type=str, choices=["vanilla", "led", "long_attention"], default=None,
+        help="Override attention type (defaults to reading from args.json in checkpoint)."
+    )
+    parser.add_argument(
+        "--local_window_size", type=int, default=512, help="Override local branch sliding window size."
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=64, help="Override number of Top-K positions for long-range retrieval."
+    )
+    parser.add_argument(
+        "--num_types", type=int, default=3, help="Override number of dependency types."
+    )
+    parser.add_argument(
+        "--bottleneck_ratio", type=float, default=0.25, help="Override bottleneck ratio for gating modules."
+    )
+    parser.add_argument(
+        "--dropout_prob", type=float, default=0.1, help="Override dropout probability."
+    )
     parser.add_argument("--verbose", action="store_true", default=False)
     return parser
 
@@ -170,7 +189,26 @@ def main() -> None:
                 }
                 logger.info("Reconstructed config from args.json: attention_type=%s", attention_type)
         except Exception as e:
-            logger.warning("Could not read args.json from checkpoint directory: %s. Using default attention_type.", e)
+            logger.warning("Could not read args.json from checkpoint directory: %s.", e)
+
+    # CLI Override for attention configuration
+    if args.attention_type is not None:
+        attention_type = args.attention_type
+        logger.info("CLI Override: attention_type=%s", attention_type)
+        
+    if attention_type != "vanilla":
+        if long_attention_config is None:
+            long_attention_config = {}
+        # Override with CLI arguments if specified, else keep checkpoint value or defaults
+        long_attention_config.update({
+            "local_window_size": args.local_window_size if args.local_window_size is not None else long_attention_config.get("local_window_size", 512),
+            "top_k": args.top_k if args.top_k is not None else long_attention_config.get("top_k", 64),
+            "num_types": args.num_types if args.num_types is not None else long_attention_config.get("num_types", 3),
+            "bottleneck_ratio": args.bottleneck_ratio if args.bottleneck_ratio is not None else long_attention_config.get("bottleneck_ratio", 0.25),
+            "dropout_prob": args.dropout_prob if args.dropout_prob is not None else long_attention_config.get("dropout_prob", 0.1),
+            "max_length": max(args.max_source_length, args.max_target_length),
+        })
+        logger.info("Final LongAttention config for loading: %s", long_attention_config)
 
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
