@@ -194,6 +194,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Per-device training and evaluation batch size.",
     )
     train_grp.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=None,
+        help="Per-device evaluation batch size. If None, defaults to --batch_size.",
+    )
+    train_grp.add_argument(
         "--learning_rate",
         type=float,
         default=2e-5,

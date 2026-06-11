@@ -493,6 +493,11 @@ def build_training_args(
 
     no_val = getattr(args, "no_val_during_train", False)
 
+    # Eval batch size: use dedicated arg if set, otherwise fall back to training batch size
+    eval_batch_size = getattr(args, "eval_batch_size", None)
+    if eval_batch_size is None:
+        eval_batch_size = args.batch_size
+
     # Build kwargs dynamically for version compatibility
     training_kwargs = {
         "output_dir": output_dir,
@@ -504,7 +509,7 @@ def build_training_args(
         "generation_max_length": getattr(args, 'max_target_length', 1024),
         "generation_num_beams": 4,     # Use beam search for higher translation quality
         "per_device_train_batch_size": args.batch_size,
-        "per_device_eval_batch_size": args.batch_size,
+        "per_device_eval_batch_size": eval_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "learning_rate": effective_lr,
         "weight_decay": 0.01,
@@ -668,6 +673,20 @@ def run_training(
     trainer.log_metrics("train", train_result.metrics)
     trainer.save_metrics("train", train_result.metrics)
     trainer.save_model(output_dir)
+
+    # ------ Free up GPU Memory before Evaluation ------
+    # Optimizer states and LR scheduler are no longer needed after training.
+    # Releasing them frees up significant VRAM for COMET model loading and beam search generation.
+    logger.info("Cleaning up training optimizer and scheduler to free VRAM for evaluation...")
+    trainer.optimizer = None
+    trainer.lr_scheduler = None
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(f"[Post-Cleanup] GPU: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
 
     # ------ Evaluation (FINAL - FULL) ------
     eval_metrics = {}
