@@ -705,6 +705,18 @@ def run_training(
         trainer.save_metrics("eval", eval_metrics)
 
         if test_dataset is not None:
+            # ------ Cleanup between Val and Test eval ------
+            # Val eval accumulates large buffers (predictions, COMET inference,
+            # decoded strings) in both GPU and CPU memory. Without cleanup,
+            # starting Test eval can push total memory over the OOM threshold.
+            logger.info("Cleaning up memory between Val and Test evaluation...")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                allocated = torch.cuda.memory_allocated() / (1024**3)
+                reserved = torch.cuda.memory_reserved() / (1024**3)
+                logger.info(f"[Post-Val-Cleanup] GPU: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+
             logger.info("Running final FULL evaluation (Test)...")
             test_sources = test_dataset.data["source"].tolist() if hasattr(test_dataset, "data") else None
             trainer.compute_metrics = make_compute_metrics(
