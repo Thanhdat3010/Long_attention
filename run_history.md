@@ -16,6 +16,8 @@ This file tracks all training and evaluation runs manually. For each run, we nam
 | | Test | `long_attention` | v3 Arch: (Killed - OOM during eval) | | - | - | - | - | |
 | **v3.1** | Val | `led` | LED GC Baseline: LR=2e-5, BS=1, accum=16, Epochs=3 | 3.8988 | 3.1793 | 8.0534 | 30.8506 | 0.4396 | `outputs/outputs_led_enfr_gc` |
 | | Test | `led` | LED GC Baseline: LR=2e-5, BS=1, accum=16, Epochs=3 | | - | 3.9266 | 39.2422 | 0.3849 | |
+| | Val | `long_attention` | v3.1 Arch: LR=2e-5, BS=1, accum=16, Epochs=3, K=64, null=0.001, div=1.0 | 4.8179 | 3.1863 | 8.6482 | 32.4925 | 0.4094 | `outputs/outputs_long_attn_enfr_gc` |
+| | Test | `long_attention` | v3.1 Arch: (Pending) | | | | | | |
 
 ### 2. Training Resource & Speed
 
@@ -25,3 +27,4 @@ This file tracks all training and evaluation runs manually. For each run, we nam
 | **v1** | `long_attention` | 7920.5765 | 7.575 | 0.473 | 0.2401 | N/A | 4.1195 |
 | **v3** | `long_attention` | 8103.8701 | 7.404 | 0.463 | 0.266 | 0.9897 | 3.9775 |
 | **v3.1 (LED)** | `led` | 6971.1842 | 8.607 | 0.538 | N/A | N/A | 3.8988 |
+| **v3.1 (LA)** | `long_attention` | 13429.7582 | 4.468 | 0.279 | 0.2682 | 0.9134 | 4.8179 |
