@@ -230,6 +230,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable COMET metric (faster evaluation, no unbabel-comet needed).",
     )
     train_grp.add_argument(
+        "--no_test",
+        action="store_true",
+        default=False,
+        help="Disable final evaluation on the test set.",
+    )
+    train_grp.add_argument(
         "--freeze_backbone",
         action="store_true",
         default=False,
@@ -526,7 +532,7 @@ def main() -> None:
         val_dataset=val_ds,
         args=args,
         output_dir=output_dir,
-        test_dataset=test_ds,
+        test_dataset=test_ds if not args.no_test else None,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         is_spt=False, # FT stage
     )
