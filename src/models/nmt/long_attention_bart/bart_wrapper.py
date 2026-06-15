@@ -109,26 +109,26 @@ def build_long_attention_model(
                 new_attn.local_attention.v_proj.bias.copy_(original_attn.v_proj.bias)
 
             # (b) Long-range Retrieval Inheritance
-            # Adaptive Scale Symmetry Breaking (ASSB): noise std = 0.3 * orig_std
-            # (increased from 0.1 to break symmetry between dependency types)
+            # Independent Channel Initialization (ICI): Only Type 0 (index 0) inherits
+            # pre-trained query projection weights from BART. Types 1 and 2 remain
+            # randomly initialized (from LongAttention creation) to break symmetry.
             q_w = new_attn.typed_retrieval.q_proj.weight
-            q_w.copy_(original_attn.q_proj.weight.repeat(num_types, 1))
-            orig_q_std = original_attn.q_proj.weight.std().item()
-            q_w.data += torch.randn_like(q_w.data) * (orig_q_std * 0.3)
+            q_w.data[0:hidden_size].copy_(original_attn.q_proj.weight)
             if original_attn.q_proj.bias is not None:
-                new_attn.typed_retrieval.q_proj.bias.copy_(original_attn.q_proj.bias.repeat(num_types))
+                new_attn.typed_retrieval.q_proj.bias.data[0:hidden_size].copy_(original_attn.q_proj.bias)
 
             # (c) Gist/Dependency Projection Inheritance
+            # Only Type 0 inherits pre-trained key/value weights from BART.
+            # Types 1 and 2 remain randomly initialized.
             kv_w = new_attn.typed_gist.multi_type_proj.weight
+            kv_chunk_size = 2 * hidden_size
             kv_template_w = torch.cat([original_attn.k_proj.weight, original_attn.v_proj.weight], dim=0)
-            kv_w.copy_(kv_template_w.repeat(num_types, 1))
-            orig_kv_std = kv_template_w.std().item()
-            kv_w.data += torch.randn_like(kv_w.data) * (orig_kv_std * 0.3)
+            kv_w.data[0:kv_chunk_size].copy_(kv_template_w)
             
             if original_attn.k_proj.bias is not None:
                 kv_b = new_attn.typed_gist.multi_type_proj.bias
                 kv_template_b = torch.cat([original_attn.k_proj.bias, original_attn.v_proj.bias], dim=0)
-                kv_b.copy_(kv_template_b.repeat(num_types))
+                kv_b.data[0:kv_chunk_size].copy_(kv_template_b)
 
             # (d) Final Out Projection Inheritance
             new_attn.out_proj.weight.copy_(original_attn.out_proj.weight)
