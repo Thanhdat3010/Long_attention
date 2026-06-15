@@ -74,8 +74,11 @@ def build_long_attention_model(
     num_layers = len(layers)
     replaced_count = 0
 
+    # Capture the original self-attention layers before we modify any of them in-place
+    original_attns = [layer.self_attn for layer in layers]
+
     for idx, layer in enumerate(layers):
-        original_attn = layer.self_attn
+        original_attn = original_attns[idx]
         hidden_size = original_attn.embed_dim
         num_heads = original_attn.num_heads
 
@@ -113,9 +116,9 @@ def build_long_attention_model(
             # Cross-Layer Weight Inheritance (CLWI):
             # Kênh 0, 1, 2 lần lượt kế thừa từ tầng idx, (idx + offset_1) % num_layers,
             # và (idx + offset_2) % num_layers của BART.
-            original_attn_0 = layers[idx].self_attn
-            original_attn_1 = layers[(idx + num_layers // 3) % num_layers].self_attn
-            original_attn_2 = layers[(idx + 2 * (num_layers // 3)) % num_layers].self_attn
+            original_attn_0 = original_attns[idx]
+            original_attn_1 = original_attns[(idx + num_layers // 3) % num_layers]
+            original_attn_2 = original_attns[(idx + 2 * (num_layers // 3)) % num_layers]
 
             q_w = new_attn.typed_retrieval.q_proj.weight
             q_w.data[0:hidden_size].copy_(original_attn_0.q_proj.weight)
