@@ -71,6 +71,7 @@ def build_long_attention_model(
 
     # ── 2. Attention Injection ─────────────────────────────────────────
     layers = model.model.encoder.layers
+    num_layers = len(layers)
     replaced_count = 0
 
     for idx, layer in enumerate(layers):
@@ -109,26 +110,46 @@ def build_long_attention_model(
                 new_attn.local_attention.v_proj.bias.copy_(original_attn.v_proj.bias)
 
             # (b) Long-range Retrieval Inheritance
-            # Independent Channel Initialization (ICI): Only Type 0 (index 0) inherits
-            # pre-trained query projection weights from BART. Types 1 and 2 remain
-            # randomly initialized (from LongAttention creation) to break symmetry.
+            # Cross-Layer Weight Inheritance (CLWI):
+            # Kênh 0, 1, 2 lần lượt kế thừa từ tầng idx, (idx + offset_1) % num_layers,
+            # và (idx + offset_2) % num_layers của BART.
+            original_attn_0 = layers[idx].self_attn
+            original_attn_1 = layers[(idx + num_layers // 3) % num_layers].self_attn
+            original_attn_2 = layers[(idx + 2 * (num_layers // 3)) % num_layers].self_attn
+
             q_w = new_attn.typed_retrieval.q_proj.weight
-            q_w.data[0:hidden_size].copy_(original_attn.q_proj.weight)
-            if original_attn.q_proj.bias is not None:
-                new_attn.typed_retrieval.q_proj.bias.data[0:hidden_size].copy_(original_attn.q_proj.bias)
+            q_w.data[0:hidden_size].copy_(original_attn_0.q_proj.weight)
+            q_w.data[hidden_size:2*hidden_size].copy_(original_attn_1.q_proj.weight)
+            q_w.data[2*hidden_size:3*hidden_size].copy_(original_attn_2.q_proj.weight)
+
+            if original_attn_0.q_proj.bias is not None:
+                q_b = new_attn.typed_retrieval.q_proj.bias
+                q_b.data[0:hidden_size].copy_(original_attn_0.q_proj.bias)
+                q_b.data[hidden_size:2*hidden_size].copy_(original_attn_1.q_proj.bias)
+                q_b.data[2*hidden_size:3*hidden_size].copy_(original_attn_2.q_proj.bias)
 
             # (c) Gist/Dependency Projection Inheritance
-            # Only Type 0 inherits pre-trained key/value weights from BART.
-            # Types 1 and 2 remain randomly initialized.
+            # Kênh 0, 1, 2 Key/Value projection kế thừa tương ứng từ 3 tầng của BART
             kv_w = new_attn.typed_gist.multi_type_proj.weight
             kv_chunk_size = 2 * hidden_size
-            kv_template_w = torch.cat([original_attn.k_proj.weight, original_attn.v_proj.weight], dim=0)
-            kv_w.data[0:kv_chunk_size].copy_(kv_template_w)
             
-            if original_attn.k_proj.bias is not None:
+            kv_temp_0 = torch.cat([original_attn_0.k_proj.weight, original_attn_0.v_proj.weight], dim=0)
+            kv_temp_1 = torch.cat([original_attn_1.k_proj.weight, original_attn_1.v_proj.weight], dim=0)
+            kv_temp_2 = torch.cat([original_attn_2.k_proj.weight, original_attn_2.v_proj.weight], dim=0)
+            
+            kv_w.data[0:kv_chunk_size].copy_(kv_temp_0)
+            kv_w.data[kv_chunk_size:2*kv_chunk_size].copy_(kv_temp_1)
+            kv_w.data[2*kv_chunk_size:3*kv_chunk_size].copy_(kv_temp_2)
+            
+            if original_attn_0.k_proj.bias is not None:
                 kv_b = new_attn.typed_gist.multi_type_proj.bias
-                kv_template_b = torch.cat([original_attn.k_proj.bias, original_attn.v_proj.bias], dim=0)
-                kv_b.data[0:kv_chunk_size].copy_(kv_template_b)
+                kv_b_temp_0 = torch.cat([original_attn_0.k_proj.bias, original_attn_0.v_proj.bias], dim=0)
+                kv_b_temp_1 = torch.cat([original_attn_1.k_proj.bias, original_attn_1.v_proj.bias], dim=0)
+                kv_b_temp_2 = torch.cat([original_attn_2.k_proj.bias, original_attn_2.v_proj.bias], dim=0)
+                
+                kv_b.data[0:kv_chunk_size].copy_(kv_b_temp_0)
+                kv_b.data[kv_chunk_size:2*kv_chunk_size].copy_(kv_b_temp_1)
+                kv_b.data[2*kv_chunk_size:3*kv_chunk_size].copy_(kv_b_temp_2)
 
             # (d) Final Out Projection Inheritance
             new_attn.out_proj.weight.copy_(original_attn.out_proj.weight)
