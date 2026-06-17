@@ -122,6 +122,10 @@ def main():
             output_dir=spt_dir,
             is_spt=True,
         )
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # 5. Training (Fine-Tuning Phase)
     final_metrics = run_qa_training(
