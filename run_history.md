@@ -22,6 +22,8 @@ This file tracks all training and evaluation runs manually. For each run, we nam
 | | Test | `long_attention` | v3.2 Arch: (No test) | | | | | | |
 | **v3.4** | Val | `long_attention` | v3.4 (CLWI): LR=2e-5, BS=1, accum=16, Epochs=3, K=128, null=0.0005, div=0.3 | 3.9005 | 3.1800 | 8.4501 | 31.9139 | 0.4108 | `outputs/outputs_long_attn_enfr_v3_4` |
 | | Test | `long_attention` | v3.4 (CLWI): (No test) | | | | | | |
+| **v3.5** | Val | `long_attention` | v3.5 (CLWI): LR=2e-5, BS=1, accum=16, Epochs=3, K=128, null=0.0005, div=0.05 | 3.8839 | - | 8.5446 | 34.0677 | 0.4064 | `outputs/outputs_long_attn_enfr_v3_5` |
+| | Test | `long_attention` | v3.5 (CLWI): (No test) | | | | | | |
 
 ### 2. Training Resource & Speed
 
@@ -34,3 +36,4 @@ This file tracks all training and evaluation runs manually. For each run, we nam
 | **v3.1 (LA)** | `long_attention` | 13429.7582 | 4.468 | 0.279 | 0.2682 | 0.9134 | 4.8179 |
 | **v3.2 (LA)** | `long_attention` | 13373.6519 | 4.486 | 0.280 | 0.2689 | 0.9154 | 4.3288 |
 | **v3.4 (LA)** | `long_attention` | 13546.2949 | 4.429 | 0.277 | 0.2726 | 0.0000 | 3.9005 |
+| **v3.5 (LA)** | `long_attention` | 14051.4035 | 4.270 | 0.267 | 0.2726 | 0.0000 | 3.8839 |
