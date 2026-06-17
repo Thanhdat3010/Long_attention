@@ -66,24 +66,42 @@ class RobertaLongAttentionForQA(RobertaPreTrainedModel):
         top_k = config.get("top_k", 64)
         num_types = config.get("num_types", 3)
         bottleneck_ratio = config.get("bottleneck_ratio", 0.25)
+        dropout_prob = config.get("dropout_prob", 0.1)
         max_length = config.get("max_length", 4096)
         
         _extend_roberta_position_embeddings(self.roberta, max_length)
         self.config.max_position_embeddings = max_length + 2
         
+        hidden_size = self.config.hidden_size
+        layers = self.roberta.encoder.layer
+        num_layers = len(layers)
+        
+        # Pre-cache các lớp attention gốc để tránh lỗi AttributeError khi thay thế in-place
+        orig_attns = [layer.attention.self for layer in layers]
+        
         replaced = 0
-        for idx, layer in enumerate(self.roberta.encoder.layer):
-            orig_attn = layer.attention.self
+        for idx, layer in enumerate(layers):
+            orig_attn = orig_attns[idx]
+            
+            try:
+                device = next(orig_attn.parameters()).device
+                dtype = next(orig_attn.parameters()).dtype
+            except StopIteration:
+                device = torch.device("cpu")
+                dtype = torch.float32
+
             new_attn = LongAttention(
-                hidden_size=self.config.hidden_size,
+                hidden_size=hidden_size,
                 num_heads=self.config.num_attention_heads,
                 local_window_size=local_window_size,
                 top_k=top_k,
                 num_types=num_types,
                 bottleneck_ratio=bottleneck_ratio,
+                dropout_prob=dropout_prob,
                 layer_idx=idx,
                 bias=True,
-            )
+            ).to(device=device, dtype=dtype)
+            
             with torch.no_grad():
                 new_attn.local_attention.q_proj.weight.copy_(orig_attn.query.weight)
                 new_attn.local_attention.k_proj.weight.copy_(orig_attn.key.weight)
@@ -92,17 +110,42 @@ class RobertaLongAttentionForQA(RobertaPreTrainedModel):
                 new_attn.local_attention.k_proj.bias.copy_(orig_attn.key.bias)
                 new_attn.local_attention.v_proj.bias.copy_(orig_attn.value.bias)
 
-                # Typed weights inheritance with ASSB noise (v3)
+                # Cross-Layer Weight Inheritance (CLWI) cho RoBERTa 12 tầng
+                orig_attn_0 = orig_attns[idx]
+                orig_attn_1 = orig_attns[(idx + num_layers // 3) % num_layers]
+                orig_attn_2 = orig_attns[(idx + 2 * (num_layers // 3)) % num_layers]
+
                 q_w = new_attn.typed_retrieval.q_proj.weight
-                q_w.copy_(orig_attn.query.weight.repeat(num_types, 1))
-                orig_q_std = orig_attn.query.weight.std().item()
-                q_w.data += torch.randn_like(q_w.data) * (orig_q_std * 0.1)
+                q_w.data[0:hidden_size].copy_(orig_attn_0.query.weight)
+                q_w.data[hidden_size:2*hidden_size].copy_(orig_attn_1.query.weight)
+                q_w.data[2*hidden_size:3*hidden_size].copy_(orig_attn_2.query.weight)
                 
+                if orig_attn_0.query.bias is not None:
+                    q_b = new_attn.typed_retrieval.q_proj.bias
+                    q_b.data[0:hidden_size].copy_(orig_attn_0.query.bias)
+                    q_b.data[hidden_size:2*hidden_size].copy_(orig_attn_1.query.bias)
+                    q_b.data[2*hidden_size:3*hidden_size].copy_(orig_attn_2.query.bias)
+                    
                 kv_w = new_attn.typed_gist.multi_type_proj.weight
-                kv_template_w = torch.cat([orig_attn.key.weight, orig_attn.value.weight], dim=0)
-                kv_w.copy_(kv_template_w.repeat(num_types, 1))
-                orig_kv_std = kv_template_w.std().item()
-                kv_w.data += torch.randn_like(kv_w.data) * (orig_kv_std * 0.1)
+                kv_chunk_size = 2 * hidden_size
+                
+                kv_temp_0 = torch.cat([orig_attn_0.key.weight, orig_attn_0.value.weight], dim=0)
+                kv_temp_1 = torch.cat([orig_attn_1.key.weight, orig_attn_1.value.weight], dim=0)
+                kv_temp_2 = torch.cat([orig_attn_2.key.weight, orig_attn_2.value.weight], dim=0)
+                
+                kv_w.data[0:kv_chunk_size].copy_(kv_temp_0)
+                kv_w.data[kv_chunk_size:2*kv_chunk_size].copy_(kv_temp_1)
+                kv_w.data[2*kv_chunk_size:3*kv_chunk_size].copy_(kv_temp_2)
+                
+                if orig_attn_0.key.bias is not None:
+                    kv_b = new_attn.typed_gist.multi_type_proj.bias
+                    kv_b_temp_0 = torch.cat([orig_attn_0.key.bias, orig_attn_0.value.bias], dim=0)
+                    kv_b_temp_1 = torch.cat([orig_attn_1.key.bias, orig_attn_1.value.bias], dim=0)
+                    kv_b_temp_2 = torch.cat([orig_attn_2.key.bias, orig_attn_2.value.bias], dim=0)
+                    
+                    kv_b.data[0:kv_chunk_size].copy_(kv_b_temp_0)
+                    kv_b.data[kv_chunk_size:2*kv_chunk_size].copy_(kv_b_temp_1)
+                    kv_b.data[2*kv_chunk_size:3*kv_chunk_size].copy_(kv_b_temp_2)
                 
                 new_attn.out_proj.weight.copy_(layer.attention.output.dense.weight)
                 new_attn.out_proj.bias.copy_(layer.attention.output.dense.bias)
