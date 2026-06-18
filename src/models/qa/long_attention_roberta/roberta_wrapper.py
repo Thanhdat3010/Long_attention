@@ -198,7 +198,7 @@ class RobertaLongAttentionForQA(RobertaPreTrainedModel):
             span_loss = (loss_fct(start_logits, start_positions) + loss_fct(end_logits, end_positions)) / 2
             # When entire batch is Yes/No (all targets=-1), span_loss is NaN (0/0). Use 0 instead.
             if torch.isnan(span_loss):
-                span_loss = torch.tensor(0.0, device=start_logits.device, requires_grad=True)
+                span_loss = torch.tensor(0.0, dtype=start_logits.dtype, device=start_logits.device, requires_grad=True)
             total_loss = span_loss
             if answer_types is not None:
                 total_loss = total_loss + 0.5 * nn.CrossEntropyLoss()(yes_no_logits, answer_types)

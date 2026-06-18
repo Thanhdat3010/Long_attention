@@ -265,7 +265,7 @@ def run_qa_training(
     # Remove parameters that HuggingFace expects to receive via collator in custom loops
     training_args = TrainingArguments(
         label_names=["start_positions", "end_positions", "answer_types"] if not is_spt else ["labels"],
-        metric_for_best_model="eval_loss" if is_spt else "eval_f1",
+        metric_for_best_model="eval_loss" if is_spt else "eval_span_valid_f1",
         greater_is_better=not is_spt,
         **training_kwargs
     )
