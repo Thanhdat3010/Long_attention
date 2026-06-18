@@ -13,6 +13,9 @@ class LongformerSelfAttention(nn.Module):
     Custom implementation of Longformer Attention (Sliding Window + Global Tokens).
     Implemented via explicit masking for exact comparison without relying on 
     pretrained Longformer weights or custom CUDA kernels.
+    
+    Fully vectorized (no per-batch for-loop) to ensure correct gradient flow
+    and better GPU utilization.
     """
     def __init__(
         self,
@@ -60,65 +63,60 @@ class LongformerSelfAttention(nn.Module):
         K_g = self.k_proj_global(hidden_states).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         V_g = self.v_proj_global(hidden_states).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # We construct a dense attention matrix but mask it to simulate Longformer exactly.
-        # This is memory-intensive for >4096 but fits well for our 4096 max_length on A100/RTX3090.
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        scores_global = torch.matmul(Q, K_g.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # Compute attention scores for both local and global paths
+        scale = math.sqrt(self.head_dim)
+        scores_local = torch.matmul(Q, K.transpose(-2, -1)) / scale    # (B, H, T, T)
+        scores_global = torch.matmul(Q, K_g.transpose(-2, -1)) / scale # (B, H, T, T)
         
-        # Base sliding window mask
+        # Base sliding window mask: (T, T) boolean
         device = hidden_states.device
         idx = torch.arange(T, device=device)
         distance = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))
-        local_mask = (distance <= (self.window_size // 2))
+        local_mask = (distance <= (self.window_size // 2))  # (T, T)
         
-        # Expand masks for batch and heads
-        final_scores = scores.clone()
-        final_V = V.clone()
-        
-        # Apply Longformer logic:
-        # If token i is global, it attends to all token j.
-        # If token j is global, it is attended by all token i (using K_g).
-        # Otherwise, use local window.
         if attention_mask is not None:
-            # attention_mask: B x T.  1 = global, 0 = local, < 0 = padding
-            is_global = (attention_mask > 0).float()
-            is_pad = (attention_mask < -1).float()
+            # attention_mask: (B, T).  1 = global, 0 = local, < -1 = padding
+            is_global = (attention_mask > 0)   # (B, T) bool
+            is_pad = (attention_mask < -1)     # (B, T) bool
             
-            for b in range(B):
-                # Global indices for this batch item
-                g_idx = torch.nonzero(is_global[b]).squeeze(-1)
-                
-                # Copy global scores into final scores for global keys
-                final_scores[b, :, :, g_idx] = scores_global[b, :, :, g_idx]
-                
-                # Combine masks
-                b_mask = local_mask.clone()
-                b_mask[g_idx, :] = True # Global tokens attend to everything
-                b_mask[:, g_idx] = True # Everything attends to global tokens
-                
-                # Apply padding mask
-                pad_idx = torch.nonzero(is_pad[b]).squeeze(-1)
-                b_mask[:, pad_idx] = False
-                
-                # Mask out invalid positions
-                final_scores[b] = final_scores[b].masked_fill(~b_mask.unsqueeze(0), float("-inf"))
+            # ---------------------------------------------------------------
+            # VECTORIZED Longformer logic (no for-loop, no in-place ops)
+            # ---------------------------------------------------------------
+            
+            # 1. Select scores: use global K scores for global keys, local K scores otherwise
+            #    global_key_mask: (B, 1, 1, T) — broadcasts over (H, T_query)
+            global_key_mask = is_global.view(B, 1, 1, T)
+            combined_scores = torch.where(global_key_mask, scores_global, scores_local)
+            
+            # 2. Build attention allow mask:
+            #    can_attend[b, i, j] = True iff:
+            #      - j is NOT padding, AND
+            #      - (i is global OR j is global OR |i-j| <= window_size//2)
+            global_q_mask = is_global.view(B, 1, T, 1)   # broadcasts over T_key
+            pad_k_mask = is_pad.view(B, 1, 1, T)          # broadcasts over T_query
+            
+            can_attend = ~pad_k_mask & (
+                global_q_mask | global_key_mask | local_mask.unsqueeze(0).unsqueeze(0)
+            )
+            
+            final_scores = combined_scores.masked_fill(~can_attend, float("-inf"))
+            
+            # 3. Blend Values: use V_g for global keys, V for local keys
+            #    global_v_mask: (B, 1, T, 1) — broadcasts over (H, d_k)
+            global_v_mask = is_global.view(B, 1, T, 1)
+            mixed_V = torch.where(global_v_mask, V_g, V)
         else:
-            final_scores = final_scores.masked_fill(~local_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            # No attention mask: pure local sliding window
+            final_scores = scores_local.masked_fill(
+                ~local_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+            )
+            mixed_V = V
 
         attn_weights = F.softmax(final_scores, dim=-1)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         attn_weights = self.dropout(attn_weights)
         
-        # For Values, if key j is global, we must use V_g for that column
-        # To do this cleanly, we can blend V and V_g based on the global mask
-        if attention_mask is not None:
-            # V: (B, H, T, D)
-            blend_mask = (attention_mask > 0).view(B, 1, T, 1).expand(-1, self.num_heads, -1, self.head_dim)
-            mixed_V = torch.where(blend_mask, V_g, V)
-            context = torch.matmul(attn_weights, mixed_V)
-        else:
-            context = torch.matmul(attn_weights, V)
-            
+        context = torch.matmul(attn_weights, mixed_V)
         context = context.transpose(1, 2).reshape(B, T, D)
         output = self.out_proj(context)
         
