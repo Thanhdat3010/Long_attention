@@ -1,14 +1,54 @@
 import logging
+import re
+import string
 from typing import Dict
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
-def make_qa_compute_metrics():
+def normalize_answer(s: str) -> str:
+    """Chuẩn hóa text theo chuẩn HotpotQA/SQuAD evaluation.
+    Lowercase, loại bỏ articles (a, an, the), dấu câu, khoảng trắng thừa.
+    """
+    s = s.lower()
+    # Remove articles
+    s = re.sub(r'\b(a|an|the)\b', ' ', s)
+    # Remove punctuation
+    s = ''.join(ch for ch in s if ch not in string.punctuation)
+    # Remove extra whitespace
+    s = ' '.join(s.split())
+    return s
+
+def compute_text_f1(prediction: str, ground_truth: str) -> float:
+    """Tính F1 dựa trên bag-of-words overlap giữa prediction và ground truth.
+    Đây là cách tính chuẩn của HotpotQA và SQuAD.
+    Returns: F1 score (0.0 to 1.0)
+    """
+    pred_tokens = normalize_answer(prediction).split()
+    gold_tokens = normalize_answer(ground_truth).split()
+    
+    if not pred_tokens and not gold_tokens:
+        return 1.0
+    if not pred_tokens or not gold_tokens:
+        return 0.0
+    
+    common = set(pred_tokens) & set(gold_tokens)
+    num_same = sum(min(pred_tokens.count(w), gold_tokens.count(w)) for w in common)
+    
+    if num_same == 0:
+        return 0.0
+    
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(gold_tokens)
+    return (2 * precision * recall) / (precision + recall)
+
+def make_qa_compute_metrics(tokenizer, eval_dataset):
     """
     Factory that returns a compute_metrics function for the QA Trainer.
     Evaluates Token-level Exact Match, Span F1, and Yes/No Accuracy,
-    along with detailed diagnostic logging to audit the QA pipeline.
+    along with Text-Level F1/EM (HotpotQA standard),
+    and detailed diagnostic logging to audit the QA pipeline.
     """
     def compute_metrics(eval_preds) -> Dict[str, float]:
         preds, labels = eval_preds.predictions, eval_preds.label_ids
@@ -20,7 +60,7 @@ def make_qa_compute_metrics():
             yes_no_logits = preds[2]
         else:
             logger.warning("Unexpected prediction format in QA metrics. Returning 0.")
-            return {"exact_match": 0.0, "f1": 0.0, "yes_no_acc": 0.0}
+            return {"exact_match": 0.0, "f1": 0.0, "yes_no_acc": 0.0, "text_f1": 0.0, "text_em": 0.0}
 
         # Extract labels safely
         if isinstance(labels, tuple) and len(labels) >= 3:
@@ -33,7 +73,7 @@ def make_qa_compute_metrics():
             answer_types = labels.get("answer_types")
         else:
             logger.warning("Could not unpack labels properly. Metrics might be skipped.")
-            return {"exact_match": 0.0, "f1": 0.0, "yes_no_acc": 0.0}
+            return {"exact_match": 0.0, "f1": 0.0, "yes_no_acc": 0.0, "text_f1": 0.0, "text_em": 0.0}
 
         # Convert to numpy arrays if they are tensors
         if hasattr(start_positions, "numpy"): start_positions = start_positions.numpy()
@@ -58,14 +98,55 @@ def make_qa_compute_metrics():
         total_yn = 0
         yn_correct = 0
         
+        text_f1_sum = 0.0
+        text_em_sum = 0.0
+        
         # Predict type distribution counters
         pred_types_count = {0: 0, 1: 0, 2: 0} # 0: Span, 1: Yes, 2: No
 
         for i in range(total_samples):
             true_type = answer_types[i]
             p_yn = pred_yn[i]
-            pred_types_count[int(p_yn)] += 1
             
+            p_start = pred_start[i]
+            p_end = pred_end[i]
+            
+            # --- Text-Level Evaluation ---
+            input_ids = eval_dataset[i]["input_ids"]
+            if isinstance(input_ids, torch.Tensor):
+                input_ids = input_ids.tolist()
+            
+            # Retrieve ground truth string
+            true_answer = eval_dataset[i].get("answer_text", "")
+            
+            # Xử lý logic type từ ground truth nếu true_answer là chuỗi rỗng
+            # (Phòng hờ lỗi data pipeline)
+            if not true_answer:
+                if true_type == 1: true_answer = "yes"
+                elif true_type == 2: true_answer = "no"
+
+            # Determine predicted type: if confidence for Yes/No is high, choose it.
+            pred_type = int(p_yn)
+            pred_types_count[pred_type] += 1
+            
+            if pred_type == 1:
+                pred_answer = "yes"
+            elif pred_type == 2:
+                pred_answer = "no"
+            else:
+                ps, pe = int(p_start), int(p_end)
+                if ps <= pe and pe < len(input_ids):
+                    pred_answer = tokenizer.decode(input_ids[ps:pe+1], skip_special_tokens=True).strip()
+                else:
+                    pred_answer = ""
+            
+            text_f1_score = compute_text_f1(pred_answer, true_answer)
+            text_em_score = 1.0 if normalize_answer(pred_answer) == normalize_answer(true_answer) else 0.0
+            
+            text_f1_sum += text_f1_score
+            text_em_sum += text_em_score
+
+            # --- Token-Position Evaluation (Legacy/Debug) ---
             if true_type == 0:  # Span answer
                 total_span += 1
                 t_start = start_positions[i]
@@ -76,10 +157,6 @@ def make_qa_compute_metrics():
                     total_span_valid += 1
                 else:
                     total_span_invalid += 1
-                
-                # Check prediction bounds
-                p_start = pred_start[i]
-                p_end = pred_end[i]
                 
                 # Compute Exact Match (EM)
                 is_em = (p_start == t_start and p_end == t_end)
@@ -113,6 +190,10 @@ def make_qa_compute_metrics():
 
         # Calculate metrics
         metrics = {}
+        
+        # Text-Level metrics (chuẩn HotpotQA — chỉ số CHÍNH)
+        metrics["text_f1"] = round((text_f1_sum / total_samples) * 100, 2)
+        metrics["text_em"] = round((text_em_sum / total_samples) * 100, 2)
         
         # Standard overall metrics (over all chunks, including invalid ones)
         if total_span > 0:
@@ -153,7 +234,11 @@ def make_qa_compute_metrics():
         logger.info(f"  - Yes Predictions          : {pred_types_count[1]} ({100*pred_types_count[1]/total_samples:.1f}%)")
         logger.info(f"  - No Predictions           : {pred_types_count[2]} ({100*pred_types_count[2]/total_samples:.1f}%)")
         logger.info("-" * 60)
-        logger.info("Overall Chunks Metrics (Traditional):")
+        logger.info("Text-Level Metrics (HotpotQA Standard):")
+        logger.info(f"  - Text F1                  : {metrics['text_f1']:.2f}%")
+        logger.info(f"  - Text EM                  : {metrics['text_em']:.2f}%")
+        logger.info("-" * 60)
+        logger.info("Token-Position Metrics (Legacy/Debug):")
         logger.info(f"  - Exact Match (EM)         : {metrics['exact_match']:.2f}%")
         logger.info(f"  - F1 Score                 : {metrics['f1']:.2f}%")
         logger.info(f"  - Yes/No Accuracy          : {metrics['yes_no_acc']:.2f}%")

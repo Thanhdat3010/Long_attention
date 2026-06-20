@@ -135,6 +135,7 @@ def prepare_hotpotqa_features(
                 "start_positions": torch.tensor(start_position, dtype=torch.long),
                 "end_positions": torch.tensor(end_position, dtype=torch.long),
                 "answer_types": torch.tensor(answer_type, dtype=torch.long),
+                "answer_text": answer_text,
             }
             
             global_mask = torch.zeros_like(feature["input_ids"])
@@ -163,8 +164,8 @@ def load_qa_dataset(
     cache_dir = Path("./data/processed/qa")
     cache_dir.mkdir(parents=True, exist_ok=True)
     
-    train_cache_path = cache_dir / f"train_len{max_length}_stride{doc_stride}_rows{max_train_rows}.pt"
-    val_cache_path = cache_dir / f"val_len{max_length}_stride{doc_stride}_rows{max_val_rows}.pt"
+    train_cache_path = cache_dir / f"train_len{max_length}_stride{doc_stride}_rows{max_train_rows}_v2.pt"
+    val_cache_path = cache_dir / f"val_len{max_length}_stride{doc_stride}_rows{max_val_rows}_v2.pt"
     
     if train_cache_path.exists() and val_cache_path.exists():
         logger.info(f"Loading cached QA dataset from {cache_dir}...")

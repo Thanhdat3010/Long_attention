@@ -265,7 +265,7 @@ def run_qa_training(
     # Remove parameters that HuggingFace expects to receive via collator in custom loops
     training_args = TrainingArguments(
         label_names=["start_positions", "end_positions", "answer_types"] if not is_spt else ["labels"],
-        metric_for_best_model="eval_loss" if is_spt else "eval_span_valid_f1",
+        metric_for_best_model="eval_loss" if is_spt else "eval_text_f1",
         greater_is_better=not is_spt,
         **training_kwargs
     )
@@ -296,15 +296,16 @@ def run_qa_training(
                     batch[k] = torch.stack([f[k] for f in features])
             return batch
         collator = qa_collator
-        compute_metrics = make_qa_compute_metrics()
-        
-    # --- Fast Eval Logic (Subset) ---
-    eval_dataset_in_trainer = val_dataset
-    val_subset_size = getattr(args, "max_val_samples_during_train", None)
-    if not is_spt and val_subset_size and val_subset_size < len(val_dataset):
-        logger.info(f"Fast Eval: Slicing val_dataset to {val_subset_size} for intermediate steps.")
-        from .data_preparation import HotpotQADataset
-        eval_dataset_in_trainer = HotpotQADataset(val_dataset.features[:val_subset_size])
+
+        # --- Fast Eval Logic (Subset) ---
+        eval_dataset_in_trainer = val_dataset
+        val_subset_size = getattr(args, "max_val_samples_during_train", None)
+        if val_subset_size and val_subset_size < len(val_dataset):
+            logger.info(f"Fast Eval: Slicing val_dataset to {val_subset_size} for intermediate steps.")
+            from .data_preparation import HotpotQADataset
+            eval_dataset_in_trainer = HotpotQADataset(val_dataset.features[:val_subset_size])
+
+        compute_metrics = make_qa_compute_metrics(tokenizer, eval_dataset_in_trainer)
 
     progress_callback = SmoothQAProgressCallback()
     callbacks = [
@@ -336,6 +337,7 @@ def run_qa_training(
     if not is_spt:
         logger.info("Running final FULL QA evaluation...")
         trainer.eval_phase = "Validation (Final)"
+        trainer.compute_metrics = make_qa_compute_metrics(tokenizer, val_dataset)
         eval_metrics = trainer.evaluate(eval_dataset=val_dataset)
         logger.info(f"Final QA Metrics: {eval_metrics}")
         

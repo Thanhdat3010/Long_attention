@@ -37,3 +37,13 @@ This file tracks all training and evaluation runs manually. For each run, we nam
 | **v3.2 (LA)** | `long_attention` | 13373.6519 | 4.486 | 0.280 | 0.2689 | 0.9154 | 4.3288 |
 | **v3.4 (LA)** | `long_attention` | 13546.2949 | 4.429 | 0.277 | 0.2726 | 0.0000 | 3.9005 |
 | **v3.5 (LA)** | `long_attention` | 14051.4035 | 4.270 | 0.267 | 0.2726 | 0.0000 | 3.8839 |
+
+## QA Runs: HotpotQA
+
+### 1. Span Extraction & Yes/No Quality
+
+| Version | Split | Attention Type | Hyperparameters | Train Loss | Eval Loss | Exact Match (EM) | F1 Score | Valid EM | Valid F1 |
+| :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Baseline** | Val (2k) | `longformer` | LR=2e-5, BS=4, max_len=2048, 20k train samples | 4.7496 | 4.7099 | 5.81% | 8.20% | 5.93% | 7.82% |
+
+*Note: The baseline above is a proof-of-concept run on a small 20k subset of HotpotQA to verify gradient flow. Full dataset training is required for competitive metrics.*
