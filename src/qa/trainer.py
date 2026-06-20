@@ -287,6 +287,7 @@ def run_qa_training(
                 return {"input_ids": item["input_ids"], "attention_mask": item["attention_mask"]}
         train_dataset = MLMDatasetWrapper(train_dataset)
         val_dataset = MLMDatasetWrapper(val_dataset)
+        eval_dataset_in_trainer = val_dataset
     else:
         # Custom collator to stack tensors
         def qa_collator(features):
