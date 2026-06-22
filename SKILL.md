@@ -1,4 +1,7 @@
 
+# Server Execution Rule
+**CRITICAL**: Không được chạy smoke test hoặc huấn luyện mô hình trực tiếp trên máy local (Windows). Máy local chỉ dành cho việc phân tích dữ liệu và kiểm tra cú pháp. Mọi tác vụ chạy thật (kể cả smoke test) phải được đẩy lên Server (thường là qua SSH, Docker hoặc sau khi Git Push).
+
 # Karpathy Guidelines
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.

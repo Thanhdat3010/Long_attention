@@ -35,6 +35,43 @@ class QATrainer(Trainer):
         self.latest_span_loss = 0.0
         self.latest_yn_loss = 0.0
 
+    def create_optimizer(self):
+        """
+        Setup the optimizer with dual learning rates.
+        Pretrained backbone gets a smaller LR (e.g., 3e-5).
+        Newly initialized heads get a larger LR (e.g., 1e-4) to learn faster.
+        """
+        if self.optimizer is None:
+            decay_parameters = [name for name in self.get_decay_parameter_names(self.model)]
+            base_lr = self.args.learning_rate
+            head_lr = 1e-4
+
+            optimizer_grouped_parameters = [
+                {
+                    "params": [p for n, p in self.model.named_parameters() if n in decay_parameters and "roberta" in n and p.requires_grad],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": base_lr,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if n not in decay_parameters and "roberta" in n and p.requires_grad],
+                    "weight_decay": 0.0,
+                    "lr": base_lr,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if n in decay_parameters and "roberta" not in n and p.requires_grad],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": head_lr,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if n not in decay_parameters and "roberta" not in n and p.requires_grad],
+                    "weight_decay": 0.0,
+                    "lr": head_lr,
+                },
+            ]
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+        return self.optimizer
+
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
         if hasattr(self, "latest_span_loss") and self.latest_span_loss > 0.0:
             logs["span"] = round(self.latest_span_loss, 4)
@@ -251,8 +288,8 @@ def run_qa_training(
         "learning_rate": effective_lr,
         "weight_decay": 0.01,
         "num_train_epochs": args.epochs if not is_spt else getattr(args, "spt_epochs", 2),
-        "lr_scheduler_type": "linear",
-        "warmup_steps": 100,
+        "lr_scheduler_type": "cosine",
+        "warmup_ratio": 0.06,
         "fp16": (args.dtype == "float16"),
         "bf16": (args.dtype == "bfloat16"),
         "seed": getattr(args, "seed", 42),

@@ -201,7 +201,7 @@ class RobertaLongAttentionForQA(RobertaPreTrainedModel):
                 span_loss = torch.tensor(0.0, dtype=start_logits.dtype, device=start_logits.device, requires_grad=True)
             total_loss = span_loss
             if answer_types is not None:
-                total_loss = total_loss + 0.5 * nn.CrossEntropyLoss()(yes_no_logits, answer_types)
+                total_loss = total_loss + 1.0 * nn.CrossEntropyLoss()(yes_no_logits, answer_types)
 
         div_loss, g_val, cnt = 0.0, 0.0, 0
         for layer in self.roberta.encoder.layer:

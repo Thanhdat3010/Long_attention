@@ -277,7 +277,7 @@ class RobertaLongformerForQA(RobertaPreTrainedModel):
                 span_loss = torch.tensor(0.0, dtype=start_logits.dtype, device=start_logits.device, requires_grad=True)
             total_loss = span_loss
             if answer_types is not None:
-                total_loss = total_loss + 0.5 * nn.CrossEntropyLoss()(yes_no_logits, answer_types)
+                total_loss = total_loss + 1.0 * nn.CrossEntropyLoss()(yes_no_logits, answer_types)
 
         return MultiTaskQAOutput(loss=total_loss, start_logits=start_logits, end_logits=end_logits, yes_no_logits=yes_no_logits)
 
